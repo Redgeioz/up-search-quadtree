@@ -1,0 +1,22 @@
+[package]
+name = "example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quadtrees = { path = "../" }
+grid = "0.11"
+rand = "0.8"
+
+[dependencies.bevy]
+version = "0.11"
+default-features = false
+features = [
+  "bevy_core_pipeline",
+  "bevy_ui",
+  "bevy_scene",
+  "bevy_winit",
+  "bevy_render",
+  "multi-threaded",
+  "bevy_gizmos",
+]

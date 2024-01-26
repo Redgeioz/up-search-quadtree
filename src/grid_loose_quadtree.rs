@@ -65,18 +65,14 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         }
 
         // Determine the root bounds to use
-        let (mut center_x, mut center_y) = world_bounds.get_center();
-        if !FIT {
+        let root_bounds = if !FIT {
             let len = root_width.max(root_height);
             root_width = len;
             root_height = len;
 
             let (min_x, min_y) = world_bounds.get_min();
-            center_x = min_x + len * 0.5;
-            center_y = min_y + len * 0.5;
-        }
-
-        let root_bounds = if !FIT {
+            let center_x = min_x + len * 0.5;
+            let center_y = min_y + len * 0.5;
             Rectangle::center_rect(center_x, center_y, root_width, root_height)
         } else {
             world_bounds.clone()
@@ -422,42 +418,46 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
             MaybeUninit::uninit(),
         ]);
 
-        [0, 1, 2, 3].into_iter().for_each(|i| {
-            let sign_x = ((i & 01) * 2) as f64 - 1.0;
+        for i in 0..4 {
+            #[rustfmt::skip]
+            let sign_x = ((i &  1) * 2) as f64 - 1.0;
             let sign_y = ((i >> 1) * 2) as f64 - 1.0;
+
             let rect = Rectangle::center_rect(
                 center_x + sign_x * offset_x,
                 center_y + sign_y * offset_y,
                 width,
                 height,
             );
+            let node = GridLooseQuadTreeNode::new(rect);
 
             // Calculate the coordinates of child nodes.
-            //   i   | x = i & 1 | y = i >> 1 |
-            // ——————|———————————|————————————|
-            //  0b00 |     0     |     0      |
-            //  0b01 |     1     |     0      |
-            //  0b10 |     0     |     1      |
-            //  0b11 |     1     |     1      |
-            // ——————|———————————|————————————|
-            let coord_x = (coord_x << 1) + (i & 01);
+            //   i   |  i & 1  |  i >> 1 |
+            // ——————|—————————|—————————|
+            //  0b00 |    0    |    0    |
+            //  0b01 |    1    |    0    |
+            //  0b10 |    0    |    1    |
+            //  0b11 |    1    |    1    |
+            // ——————|—————————|—————————|
+            #[rustfmt::skip]
+            let coord_x = (coord_x << 1) + (i &  1);
             let coord_y = (coord_y << 1) + (i >> 1);
-            let node = GridLooseQuadTreeNode::new(rect);
 
             children[i].write(node);
 
             let node = unsafe { children[i].assume_init_mut() };
 
             let next_level = level + 1;
-            let grid = grids.get_mut(next_level).unwrap();
-            if grid.get(coord_y, coord_x).is_some() {
+            if grids
+                .get(next_level)
+                .unwrap()
+                .get(coord_y, coord_x)
+                .is_some()
+            {
                 node.split(grids, (next_level, coord_x, coord_y), max_level);
+                grids[next_level][coord_y][coord_x] = node as *mut Self;
             }
-
-            if let Some(ptr) = grids[next_level].get_mut(coord_y, coord_x) {
-                *ptr = node as *mut Self;
-            }
-        });
+        }
 
         let children = unsafe { transmute::<_, Box<[Self; 4]>>(children) };
 

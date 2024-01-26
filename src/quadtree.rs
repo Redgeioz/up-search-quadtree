@@ -237,8 +237,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         let offset_y = height / 2.0;
 
         let children = [0, 1, 2, 3].map(|i| {
-            let sign_x = ((i & 01) * 2) as f64 - 1.0;
+            #[rustfmt::skip]
+            let sign_x = ((i &  1) * 2) as f64 - 1.0;
             let sign_y = ((i >> 1) * 2) as f64 - 1.0;
+
             self.create_child(Rectangle::center_rect(
                 center_x + sign_x * offset_x,
                 center_y + sign_y * offset_y,

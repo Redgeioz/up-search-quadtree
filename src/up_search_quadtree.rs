@@ -81,7 +81,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         }
 
         // Determine the root bounds to use
-        let (mut center_x, mut center_y) = world_bounds.get_center();
+        let (center_x, center_y, root_bounds);
         if !FIT {
             let len = root_width.max(root_height);
             root_width = len;
@@ -90,17 +90,21 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             let (min_x, min_y) = world_bounds.get_min();
             center_x = min_x + len * 0.5;
             center_y = min_y + len * 0.5;
-        }
-
-        let root_bounds = if !FIT {
-            Rectangle::center_rect(center_x, center_y, root_width, root_height)
+            root_bounds = Rectangle::center_rect(center_x, center_y, root_width, root_height)
         } else {
-            world_bounds.clone()
-        };
+            (center_x, center_y) = world_bounds.get_center();
+            root_bounds = world_bounds.clone();
+        }
 
         // Initialize all nodes
         let root = UpSearchQuadTreeNode::new(center_x, center_y);
-        root.split(&mut grids, (1, 0, 0), root_width, root_height, MAX_LEVEL);
+        root.split(
+            &mut grids,
+            (1, 0, 0),
+            root_width,
+            root_height,
+            MAX_LEVEL as usize,
+        );
         grids[1][0][0].write(root);
 
         let grids = unsafe { transmute::<_, Grids<T, LOOSENESS>>(grids) };
@@ -223,8 +227,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         let (nl, nx, ny) = curt_coord;
         let (ol, ox, oy) = prev_coord;
 
-        self.grids[ol as usize][oy][ox].remove(item);
-        self.grids[nl as usize][ny][nx].add(bounds, item);
+        self.grids[ol][oy][ox].remove(item);
+        self.grids[nl][ny][nx].add(bounds, item);
     }
 
     /// Search from the bottom up. Execute the callback function for each item found.
@@ -367,10 +371,10 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
         position: Coord,
         root_width: f64,
         root_height: f64,
-        max_level: u8,
+        max_level: usize,
     ) {
         let (level, coord_x, coord_y) = position;
-        if level as u8 >= max_level {
+        if level >= max_level {
             return;
         }
 
@@ -386,23 +390,26 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
         let offset_x = width / 2.0;
         let offset_y = height / 2.0;
 
-        [0, 1, 2, 3].into_iter().for_each(|i| {
-            let sign_x = ((i & 01) * 2) as f64 - 1.0;
+        for i in 0..4 {
+            #[rustfmt::skip]
+            let sign_x = ((i &  1) * 2) as f64 - 1.0;
             let sign_y = ((i >> 1) * 2) as f64 - 1.0;
+
             let node = UpSearchQuadTreeNode::new(
                 center_x + sign_x * offset_x,
                 center_y + sign_y * offset_y,
             );
 
             // Calculate the coordinates of child nodes.
-            //   i   | x = i & 1 | y = i >> 1 |
-            // ——————|———————————|————————————|
-            //  0b00 |     0     |     0      |
-            //  0b01 |     1     |     0      |
-            //  0b10 |     0     |     1      |
-            //  0b11 |     1     |     1      |
-            // ——————|———————————|————————————|
-            let coord_x = (coord_x << 1) + (i & 01);
+            //   i   |  i & 1  |  i >> 1 |
+            // ——————|—————————|—————————|
+            //  0b00 |    0    |    0    |
+            //  0b01 |    1    |    0    |
+            //  0b10 |    0    |    1    |
+            //  0b11 |    1    |    1    |
+            // ——————|—————————|—————————|
+            #[rustfmt::skip]
+            let coord_x = (coord_x << 1) + (i &  1);
             let coord_y = (coord_y << 1) + (i >> 1);
 
             let next_level = level + 1;
@@ -422,7 +429,7 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
                 );
                 grids[next_level][coord_y][coord_x].write(node);
             }
-        });
+        }
     }
 
     fn search_up_3x3(

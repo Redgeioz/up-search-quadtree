@@ -1,5 +1,3 @@
-#![feature(const_option)]
-#![feature(get_many_mut)]
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     prelude::*,
@@ -11,7 +9,6 @@ use rand::*;
 use std::f64::consts::PI;
 
 const MAX_LEVEL: u8 = 7;
-const LOOSENESS: Looseness = Looseness::from_f64(2.0).unwrap();
 
 const BOUND_WIDTH: f64 = 1024.0;
 const BOUND_HEIGHT: f64 = 512.0;
@@ -21,7 +18,7 @@ const MAX_RADIUS: f64 = 4.0;
 const MIN_VELOCITY: f64 = 0.2;
 const MAX_VELOCITY: f64 = 1.0;
 
-type QTree = UpSearchQuadTree<usize, MAX_LEVEL, LOOSENESS>;
+type QTree = UpSearchQuadTree<usize, MAX_LEVEL>;
 
 #[derive(Resource)]
 struct Data {
@@ -103,7 +100,14 @@ fn update(mut res: ResMut<Data>, mut gizmos: Gizmos) {
                 return;
             }
 
-            let [this, other] = balls.get_many_mut([id, other_id]).unwrap();
+            // let [this, other] = balls.get_many_mut([id, other_id]).unwrap();
+            let (this, other) = if other_id > id {
+                let (s1, s2) = balls.split_at_mut(other_id);
+                (&mut s1[id], &mut s2[0])
+            } else {
+                let (s1, s2) = balls.split_at_mut(id);
+                (&mut s2[0], &mut s1[other_id])
+            };
 
             this.collide(other);
         });

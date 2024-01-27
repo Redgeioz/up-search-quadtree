@@ -1,5 +1,4 @@
 use crate::rect::Rectangle;
-use crate::Looseness;
 use grid::*;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -7,7 +6,7 @@ use std::mem::transmute;
 use std::mem::MaybeUninit;
 
 type Coord = (usize, usize, usize);
-type Grids<T, const LOOSENESS: Looseness> = Vec<Grid<UpSearchQuadTreeNode<T, LOOSENESS>>>;
+type Grids<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 
 /// An optimized [`GridLooseQuadTree`] retaining only the up-search function
 ///
@@ -21,33 +20,29 @@ type Grids<T, const LOOSENESS: Looseness> = Vec<Grid<UpSearchQuadTreeNode<T, LOO
 /// entire rectangle, which can reduce the size of each node.
 ///
 /// [`GridLooseQuadTree`]: crate::grid_loose_quadtree::GridLooseQuadTree
-pub struct UpSearchQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> {
-    grids: Grids<T, LOOSENESS>,
+pub struct UpSearchQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
+    grids: Grids<T>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     items: HashMap<T, Coord>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
-    UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     /// Create a new quadtree with the given bounds.
     ///
     /// Force using a square as the bounds of each node. This usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    pub fn new(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
     /// Create a new quadtree with the given bounds.
     ///
     /// Make the bounds of each node fit the given bounds instead of forcing it to be square.
-    pub fn new_fit(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    pub fn new_fit(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(
-        world_bounds: Rectangle,
-    ) -> UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
         let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
         assert!(
@@ -73,7 +68,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             let mut vec = Vec::with_capacity(rows * cols);
             for _ in 0..rows {
                 for _ in 0..cols {
-                    vec.push(MaybeUninit::<UpSearchQuadTreeNode<T, LOOSENESS>>::uninit());
+                    vec.push(MaybeUninit::<UpSearchQuadTreeNode<T>>::uninit());
                 }
             }
             grids.push(Grid::from_vec(vec, cols));
@@ -107,7 +102,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         );
         grids[1][0][0].write(root);
 
-        let grids = unsafe { transmute::<_, Grids<T, LOOSENESS>>(grids) };
+        let grids = unsafe { transmute::<_, Grids<T>>(grids) };
 
         UpSearchQuadTree {
             grids,
@@ -163,20 +158,15 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         (level, coord_x, coord_y)
     }
 
-    fn get_root(&self) -> &UpSearchQuadTreeNode<T, LOOSENESS> {
+    fn get_root(&self) -> &UpSearchQuadTreeNode<T> {
         unsafe { self.grids.get_unchecked(1).get_unchecked(0, 0) }
     }
 
-    fn get_node(&self, level: usize, x: usize, y: usize) -> &UpSearchQuadTreeNode<T, LOOSENESS> {
+    fn get_node(&self, level: usize, x: usize, y: usize) -> &UpSearchQuadTreeNode<T> {
         &self.grids[level][y][x]
     }
 
-    fn get_node_mut(
-        &mut self,
-        level: usize,
-        x: usize,
-        y: usize,
-    ) -> &mut UpSearchQuadTreeNode<T, LOOSENESS> {
+    fn get_node_mut(&mut self, level: usize, x: usize, y: usize) -> &mut UpSearchQuadTreeNode<T> {
         &mut self.grids[level][y][x]
     }
 
@@ -251,7 +241,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         let (offset_x, offset_y) = root_bounds.get_min();
 
         let grids = &self.grids;
-        let looseness = LOOSENESS.to_f64();
         if level != MAX_LEVEL as usize {
             // top left
             let min_x = bounds.min_x - offset_x;
@@ -261,8 +250,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             let max_x = bounds.max_x - offset_x;
             let max_y = bounds.max_y - offset_y;
 
-            let calc_min = |n: f64| ((n + (1.0 - (looseness - 1.0) / 2.0)).trunc() - 1.0) as usize;
-            let calc_max = |n: f64| (n + (looseness - 1.0) / 2.0).trunc() as usize;
+            let calc_min = |n: f64| ((n + 0.5).trunc() - 1.0) as usize;
+            let calc_max = |n: f64| (n + 0.5).trunc() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
             for level in ((level + 1)..=MAX_LEVEL as usize).rev() {
@@ -310,24 +299,17 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         let coord_y = (((y - offset_y) / node_height) as usize).min(grid_height - 1);
 
         let node = self.get_node(level, coord_x, coord_y);
-        node.search_up_3x3(
-            grids,
-            (level, coord_x, coord_y),
-            node_width,
-            node_height,
-            bounds,
-            &mut callback,
-        );
+        node.search_up_3x3(grids, (level, coord_x, coord_y), bounds, &mut callback);
     }
 }
 
-struct UpSearchQuadTreeNode<T: Copy + Eq, const LOOSENESS: Looseness> {
+struct UpSearchQuadTreeNode<T: Copy + Eq> {
     center_x: f64,
     center_y: f64,
     items: Vec<(Rectangle, T)>,
 }
 
-impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS> {
+impl<T: Copy + Eq> UpSearchQuadTreeNode<T> {
     fn new(center_x: f64, center_y: f64) -> Self {
         Self {
             center_x,
@@ -434,10 +416,8 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
 
     fn search_up_3x3(
         &self,
-        grids: &Grids<T, LOOSENESS>,
+        grids: &Grids<T>,
         position: Coord,
-        node_width: f64,
-        node_height: f64,
         bounds: &Rectangle,
         callback: &mut impl FnMut(T),
     ) {
@@ -448,18 +428,8 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
             let grid_height = grid.rows();
             let (center_x, center_y) = self.get_center();
 
-            let looseness = LOOSENESS.to_f64();
-
-            // range 0 ~ 0.5
-            let coeff = 0.5 - (looseness - 1.0) / 2.0;
-
-            let y_top = center_y - node_height * coeff;
-            let y_bottom = center_y + node_height * coeff;
-            let x_left = center_x - node_width * coeff;
-            let x_right = center_x + node_width * coeff;
-
-            if bounds.min_y < y_top && y != 0 {
-                if bounds.min_x < x_left && x != 0 {
+            if bounds.min_y < center_y && y != 0 {
+                if bounds.min_x < center_x && x != 0 {
                     let node = grid.get_unchecked(y - 1, x - 1);
                     node.search_items(bounds, callback);
                 }
@@ -469,14 +439,14 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
                     node.search_items(bounds, callback);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = grid.get_unchecked(y - 1, x + 1);
                     node.search_items(bounds, callback);
                 }
             }
 
             {
-                if bounds.min_x < x_left && x != 0 {
+                if bounds.min_x < center_x && x != 0 {
                     let node = grid.get_unchecked(y, x - 1);
                     node.search_items(bounds, callback);
                 }
@@ -485,14 +455,14 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
                     self.search_items(bounds, callback);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = grid.get_unchecked(y, x + 1);
                     node.search_items(bounds, callback);
                 }
             }
 
-            if bounds.max_y > y_bottom && y + 1 != grid_height {
-                if bounds.min_x < x_left && x != 0 {
+            if bounds.max_y > center_y && y + 1 != grid_height {
+                if bounds.min_x < center_x && x != 0 {
                     let node = grid.get_unchecked(y + 1, x - 1);
                     node.search_items(bounds, callback);
                 }
@@ -502,7 +472,7 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
                     node.search_items(bounds, callback);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = grid.get_unchecked(y + 1, x + 1);
                     node.search_items(bounds, callback);
                 }
@@ -517,14 +487,7 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
             if level == 2 {
                 parent.search_items(bounds, callback);
             } else {
-                parent.search_up_3x3(
-                    grids,
-                    next_pos,
-                    node_width / 2.0,
-                    node_height / 2.0,
-                    bounds,
-                    callback,
-                );
+                parent.search_up_3x3(grids, next_pos, bounds, callback);
             }
         }
     }
@@ -538,11 +501,5 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> UpSearchQuadTreeNode<T, LOOSENESS
     }
 }
 
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> Send
-    for UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
-}
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> Sync
-    for UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
-}
+unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Send for UpSearchQuadTree<T, MAX_LEVEL> {}
+unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Sync for UpSearchQuadTree<T, MAX_LEVEL> {}

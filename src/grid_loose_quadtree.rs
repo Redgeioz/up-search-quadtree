@@ -1,4 +1,3 @@
-use super::Looseness;
 use crate::rect::Rectangle;
 use grid::*;
 use std::collections::HashMap;
@@ -7,37 +6,33 @@ use std::mem::{transmute, MaybeUninit};
 use std::ptr;
 
 type Coord = (usize, usize, usize);
-type Grids<T, const LOOSENESS: Looseness> = Vec<Grid<*mut GridLooseQuadTreeNode<T, LOOSENESS>>>;
+type Grids<T> = Vec<Grid<*mut GridLooseQuadTreeNode<T>>>;
 
 /// An implementation of a loose quadtree with grid.
-pub struct GridLooseQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> {
-    root: Box<GridLooseQuadTreeNode<T, LOOSENESS>>,
+pub struct GridLooseQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
+    root: Box<GridLooseQuadTreeNode<T>>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
-    grids: Box<Grids<T, LOOSENESS>>,
+    grids: Box<Grids<T>>,
     items: HashMap<T, Coord>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
-    GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     /// Create a new quadtree with the given bounds.
     ///
     /// Force using a square as the bounds of each node. This usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    pub fn new(world_bounds: Rectangle) -> GridLooseQuadTree<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
     /// Create a new quadtree with the given bounds.
     ///
     /// Make the bounds of each node fit the given bounds instead of forcing it to be square.
-    pub fn new_fit(world_bounds: Rectangle) -> GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    pub fn new_fit(world_bounds: Rectangle) -> GridLooseQuadTree<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(
-        world_bounds: Rectangle,
-    ) -> GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> GridLooseQuadTree<T, MAX_LEVEL> {
         let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
         assert!(
@@ -78,7 +73,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             world_bounds.clone()
         };
 
-        let looseness = LOOSENESS.to_f64();
+        let looseness = 2.0;
         let loose_bounds = root_bounds.scale(looseness);
 
         // Initialize all nodes
@@ -90,7 +85,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             grids,
         };
 
-        (this.grids[1])[0][0] = this.root.as_mut() as *mut GridLooseQuadTreeNode<T, LOOSENESS>;
+        (this.grids[1])[0][0] = this.root.as_mut() as *mut GridLooseQuadTreeNode<T>;
         this.root
             .split(&mut this.grids, (1, 0, 0), MAX_LEVEL as usize);
         this
@@ -142,16 +137,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         (level, coord_x, coord_y)
     }
 
-    fn get_node(&self, level: usize, x: usize, y: usize) -> &GridLooseQuadTreeNode<T, LOOSENESS> {
+    fn get_node(&self, level: usize, x: usize, y: usize) -> &GridLooseQuadTreeNode<T> {
         unsafe { &*self.grids[level][y][x] }
     }
 
-    fn get_node_mut(
-        &mut self,
-        level: usize,
-        x: usize,
-        y: usize,
-    ) -> &mut GridLooseQuadTreeNode<T, LOOSENESS> {
+    fn get_node_mut(&mut self, level: usize, x: usize, y: usize) -> &mut GridLooseQuadTreeNode<T> {
         unsafe { &mut *self.grids[level][y][x] }
     }
 
@@ -242,7 +232,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
         let (offset_x, offset_y) = root_bounds.get_min();
 
         let grids = &self.grids;
-        let looseness = LOOSENESS.to_f64();
         if level != MAX_LEVEL as usize {
             // top left
             let min_x = bounds.min_x - offset_x;
@@ -252,8 +241,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
             let max_x = bounds.max_x - offset_x;
             let max_y = bounds.max_y - offset_y;
 
-            let calc_min = |n: f64| ((n + (1.0 - (looseness - 1.0) / 2.0)).trunc() - 1.0) as usize;
-            let calc_max = |n: f64| (n + (looseness - 1.0) / 2.0).trunc() as usize;
+            let calc_min = |n: f64| ((n + 0.5).trunc() - 1.0) as usize;
+            let calc_max = |n: f64| (n + 0.5).trunc() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
             for level in ((level + 1)..=MAX_LEVEL as usize).rev() {
@@ -355,13 +344,13 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness>
     }
 }
 
-struct GridLooseQuadTreeNode<T: Copy + Eq, const LOOSENESS: Looseness> {
+struct GridLooseQuadTreeNode<T: Copy + Eq> {
     loose_bounds: Rectangle,
     items: Vec<(Rectangle, T)>,
     children: Option<Box<[Self; 4]>>,
 }
 
-impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENESS> {
+impl<T: Copy + Eq> GridLooseQuadTreeNode<T> {
     fn new(loose_bounds: Rectangle) -> Self {
         Self {
             loose_bounds,
@@ -395,13 +384,13 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
     }
 
     /// Initialize all nodes at once
-    fn split(&mut self, grids: &mut Grids<T, LOOSENESS>, position: Coord, max_level: usize) {
+    fn split(&mut self, grids: &mut Grids<T>, position: Coord, max_level: usize) {
         let (level, coord_x, coord_y) = position;
         if level >= max_level {
             return;
         }
 
-        let looseness = LOOSENESS.to_f64();
+        let looseness = 2.0;
         let (center_x, center_y) = self.loose_bounds.get_center();
 
         // wh of loose bounds of child nodes
@@ -466,7 +455,7 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
 
     fn search_up_3x3<const DOWN: bool>(
         &self,
-        grids: &Grids<T, LOOSENESS>,
+        grids: &Grids<T>,
         position: Coord,
         bounds: &Rectangle,
         callback: &mut impl FnMut(T),
@@ -486,20 +475,8 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
             let grid_height = grid.rows();
             let (center_x, center_y) = self.loose_bounds.get_center();
 
-            let looseness = LOOSENESS.to_f64();
-            let width = self.loose_bounds.get_width() / looseness;
-            let height = self.loose_bounds.get_height() / looseness;
-
-            // range 0 ~ 0.5
-            let coeff = 0.5 - (looseness - 1.0) / 2.0;
-
-            let y_top = center_y - height * coeff;
-            let y_bottom = center_y + height * coeff;
-            let x_left = center_x - width * coeff;
-            let x_right = center_x + width * coeff;
-
-            if bounds.min_y < y_top && y != 0 {
-                if bounds.min_x < x_left && x != 0 {
+            if bounds.min_y < center_y && y != 0 {
+                if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y - 1, x - 1);
                     search(node);
                 }
@@ -509,14 +486,14 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
                     search(node);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y - 1, x + 1);
                     search(node);
                 }
             }
 
             {
-                if bounds.min_x < x_left && x != 0 {
+                if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y, x - 1);
                     search(node);
                 }
@@ -525,14 +502,14 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
                     search(self);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y, x + 1);
                     search(node);
                 }
             }
 
-            if bounds.max_y > y_bottom && y + 1 != grid_height {
-                if bounds.min_x < x_left && x != 0 {
+            if bounds.max_y > center_y && y + 1 != grid_height {
+                if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y + 1, x - 1);
                     search(node);
                 }
@@ -542,7 +519,7 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
                     search(node);
                 }
 
-                if bounds.max_x > x_right && x + 1 != grid_width {
+                if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y + 1, x + 1);
                     search(node);
                 }
@@ -605,11 +582,5 @@ impl<T: Copy + Eq, const LOOSENESS: Looseness> GridLooseQuadTreeNode<T, LOOSENES
     }
 }
 
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> Send
-    for GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
-}
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> Sync
-    for GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
-}
+unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Send for GridLooseQuadTree<T, MAX_LEVEL> {}
+unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Sync for GridLooseQuadTree<T, MAX_LEVEL> {}

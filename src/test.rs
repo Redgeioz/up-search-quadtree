@@ -3,14 +3,12 @@ use crate::grid_loose_quadtree::GridLooseQuadTree;
 use crate::quadtree::QuadTree;
 use crate::rect::*;
 use crate::up_search_quadtree::UpSearchQuadTree;
-use crate::Looseness;
 use rand::*;
 use std::collections::HashSet;
 use std::f64::consts::PI;
 
 const MAX_LEVEL: u8 = 7;
 const MAX_ITEMS: usize = 8;
-const LOOSENESS: Looseness = Looseness::from_f64(2.0).unwrap();
 
 const BOUND_WIDTH: f64 = 1024.0;
 const BOUND_HEIGHT: f64 = 512.0;
@@ -29,8 +27,8 @@ fn check_quadtrees() {
 
 fn single_check() {
     let bounds = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
-    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
-    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
+    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let mut quadtree_normal = QuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(bounds.clone());
 
     let mut balls = Vec::with_capacity(BALL_COUNT);

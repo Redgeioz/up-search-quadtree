@@ -1,28 +1,24 @@
-#![feature(adt_const_params)]
-#![feature(const_option)]
 use std::hash::Hash;
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion, SamplingMode};
 
 use lib::ball::*;
 use lib::grid_loose_quadtree::GridLooseQuadTree;
 use lib::quadtree::QuadTree;
 use lib::rect::*;
 use lib::up_search_quadtree::UpSearchQuadTree;
-use lib::Looseness;
 use rand::*;
 
 const MAX_LEVEL: u8 = 7;
 const MAX_ITEMS: usize = 8;
-const LOOSENESS: Looseness = Looseness::from_f64(2.0).unwrap();
 
 const BOUND_WIDTH: f64 = 20000.0;
 const BOUND_HEIGHT: f64 = 20000.0;
 
 const AMOUNT_SMALL: usize = 2000;
 const AMOUNT_MEDIUM: usize = 5000;
-const AMOUNT_LARGE: usize = 12500;
+const AMOUNT_LARGE: usize = 10000;
 
 // level 9~10 size
 const MIN_RADIUS: f64 = 25.0;
@@ -40,17 +36,13 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> QTree<T>
-    for GridLooseQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for GridLooseQuadTree<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const LOOSENESS: Looseness> QTree<T>
-    for UpSearchQuadTree<T, MAX_LEVEL, LOOSENESS>
-{
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTree<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
@@ -91,6 +83,9 @@ fn gen_balls(
 
 fn quadtree(c: &mut Criterion) {
     let mut g = c.benchmark_group("QuadTree");
+
+    g.sample_size(75);
+    g.sampling_mode(SamplingMode::Flat);
 
     let bounds = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
@@ -137,9 +132,12 @@ fn quadtree(c: &mut Criterion) {
 fn quadtree_loose(c: &mut Criterion) {
     let mut g = c.benchmark_group("GridLooseQuadTree");
 
+    g.sample_size(75);
+    g.sampling_mode(SamplingMode::Flat);
+
     let bounds = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
-    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_loose, &bounds, AMOUNT_SMALL, 1);
 
     g.bench_function("Search (samll amount)", |b| {
@@ -162,7 +160,7 @@ fn quadtree_loose(c: &mut Criterion) {
     //     });
     // });
 
-    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_loose, &bounds, AMOUNT_MEDIUM, 2);
 
     g.bench_function("Search (medium amount)", |b| {
@@ -185,7 +183,7 @@ fn quadtree_loose(c: &mut Criterion) {
     //     });
     // });
 
-    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_loose, &bounds, AMOUNT_LARGE, 3);
 
     g.bench_function("Search (large amount)", |b| {
@@ -212,9 +210,12 @@ fn quadtree_loose(c: &mut Criterion) {
 fn quadtree_us(c: &mut Criterion) {
     let mut g = c.benchmark_group("UpSearchQuadTree");
 
+    g.sample_size(75);
+    g.sampling_mode(SamplingMode::Flat);
+
     let bounds = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
-    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_us, &bounds, AMOUNT_SMALL, 1);
 
     g.bench_function("Search (small amount)", |b| {
@@ -227,7 +228,7 @@ fn quadtree_us(c: &mut Criterion) {
         });
     });
 
-    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_us, &bounds, AMOUNT_MEDIUM, 2);
 
     g.bench_function("Search (medium amount)", |b| {
@@ -240,7 +241,7 @@ fn quadtree_us(c: &mut Criterion) {
         });
     });
 
-    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL, LOOSENESS>::new(bounds.clone());
+    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let bounds_cache = gen_balls(&mut quadtree_us, &bounds, AMOUNT_LARGE, 3);
 
     g.bench_function("Search (large amount)", |b| {

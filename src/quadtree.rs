@@ -1,4 +1,5 @@
 use crate::rect::Rectangle;
+
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ptr;
@@ -187,7 +188,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     ) -> QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS> {
         QuadTreeNode {
             level: lv,
-            items: Vec::new(),
+            items: Vec::with_capacity(MAX_ITEMS),
             bounds,
             children: None,
             parent,
@@ -249,24 +250,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             ))
         });
 
-        let mut children = Box::new(children);
-
-        children.iter_mut().for_each(|node| {
-            let mut count = 0;
-            let len = self.items.len();
-            for i in 0..len {
-                let (bounds, item) = &self.items[i];
-                if node.bounds.contains(bounds) {
-                    *item_locations.get_mut(item).unwrap() = node as *mut Self;
-                    count += 1;
-                } else if count > 0 {
-                    self.items.swap(i - count, i);
-                }
-            }
-            node.items = self.items.split_off(len - count);
-        });
-
-        self.children = Some(children);
+        self.children = Some(Box::new(children));
+        let items = std::mem::replace(&mut self.items, Vec::with_capacity(MAX_ITEMS));
+        items
+            .into_iter()
+            .for_each(|(bounds, item)| self.insert(bounds, item, item_locations));
     }
 
     fn insert(&mut self, bounds: Rectangle, item: T, item_locations: &mut HashMap<T, *mut Self>) {
@@ -323,11 +311,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     }
 
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
-        for (b, item) in self.items.iter() {
-            if b.intersects(bounds) {
-                callback(*item);
-            }
-        }
+        self.items
+            .iter()
+            .filter(|(b, _)| b.intersects(bounds))
+            .for_each(|(_, item)| callback(*item));
     }
 }
 

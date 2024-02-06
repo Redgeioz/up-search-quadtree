@@ -19,7 +19,7 @@ The combination of a loose quadtree with a multilayer grid enables O(1) time com
 
 Including an example of ball collisions, a simple benchmark on searching, and three types of quadtree  implementations.
 
-Among them, `quadtree.rs` is a normal quadtree implementation. `grid_loose_quadtree.rs` is a loose quadtree combined with a multilayers grid, which also implements the up-search function. Additionally, `up_search_quadtree.rs` is the result obtained by retaining only the up-search function and optimization based on `grid_loose_quadtree.rs`.
+Among them, `quadtree.rs` is a normal quadtree implementation. `grid_loose_quadtree.rs` is a loose quadtree combined with a multilayers grid, which also implements the up-search function. Additionally, `up_search_quadtree.rs` is the result obtained by retaining only the up-search function and optimization based on `grid_loose_quadtree.rs`. 
 
 ## Benchmark
 
@@ -31,7 +31,7 @@ Search 10000 times among 10000 balls of different sizes using the bounds of each
 
 | Quadtree| GridLooseQuadtree | UpSearchQuadtree |
 |:-------:|:-----------------:|:----------------:|
-| 7.72ms  | 4.98ms            | 2.95ms           |
+| 7.08ms  | 4.79ms            | 2.82ms           |
 
 Of these, the first two results are obtained using the traditional method.
 

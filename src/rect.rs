@@ -13,7 +13,7 @@ pub struct Rectangle {
 
 impl Rectangle {
     #[inline]
-    pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Rectangle {
+    pub const fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Rectangle {
         Rectangle {
             min_x,
             min_y,

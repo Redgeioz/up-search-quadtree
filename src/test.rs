@@ -1,8 +1,5 @@
-use crate::ball::*;
-use crate::grid_loose_quadtree::GridLooseQuadTree;
-use crate::quadtree::QuadTree;
-use crate::rect::*;
-use crate::up_search_quadtree::UpSearchQuadTree;
+use crate::{ball::*, rect::*, *};
+
 use rand::*;
 use std::collections::HashSet;
 use std::f64::consts::PI;

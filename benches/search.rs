@@ -45,6 +45,12 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTree<T, 
     }
 }
 
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+}
+
 fn gen_balls(quadtree: &mut impl QTree<usize>, count: usize, seed: u64) -> Vec<Rectangle> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut balls = Vec::with_capacity(count);
@@ -111,6 +117,21 @@ fn quadtree_us(c: &mut Criterion) {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
                 quadtree_us.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn quadtree_uso(c: &mut Criterion) {
+    let mut quadtree_uso = UpSearchQuadTreeOriginal::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut quadtree_uso, AMOUNT, 3);
+
+    c.bench_function("UpSearchQuadTreeOriginal", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                quadtree_uso.search(bounds, |id| {
                     black_box(id);
                 });
             });

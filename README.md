@@ -15,11 +15,11 @@ The combination of a loose quadtree with a multilayer grid enables O(1) time com
 - Low space utilization when there are fewer entities
 - Looseness can only be 2
 
-## Files
+## Quadtrees Included in This Repository
 
-Including an example of ball collisions, a simple benchmark on searching, and three types of quadtree  implementations.
+`quadtree.rs` is a normal quadtree implementation. `grid_loose_quadtree.rs` is a loose quadtree combined with a multilayers grid, which also implements the up-search function. Additionally, `up_search_quadtree.rs` is the result obtained by retaining only the up-search function and optimization based on `grid_loose_quadtree.rs`. 
 
-Among them, `quadtree.rs` is a normal quadtree implementation. `grid_loose_quadtree.rs` is a loose quadtree combined with a multilayers grid, which also implements the up-search function. Additionally, `up_search_quadtree.rs` is the result obtained by retaining only the up-search function and optimization based on `grid_loose_quadtree.rs`. 
+`grid_loose_quadtree_original.rs` is the original idea of up-search quadtree, which achieves O(1) insertion on a regular (non-loose) quadtree by an O(1) lowest common ancestor finding approach. Although using the up-search method, there is basically no performance improvement. However, this file may be helpful in understanding the up-search method, as it is simpler than the current version.
 
 ## Benchmark
 
@@ -34,17 +34,3 @@ Search 10000 times among 10000 balls of different sizes using the bounds of each
 | 7.08ms  | 4.79ms            | 2.82ms           |
 
 Of these, the first two results are obtained using the traditional method.
-
-## Example
-
-```bash
-cd example
-```
-
-```bash
-cargo run
-```
-or
-```bash
-cargo run --release
-```

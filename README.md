@@ -19,7 +19,7 @@ The combination of a loose quadtree with a multilayer grid enables O(1) time com
 
 `quadtree.rs` is a normal quadtree implementation. `grid_loose_quadtree.rs` is a loose quadtree combined with a multilayers grid, which also implements the up-search function. Additionally, `up_search_quadtree.rs` is the result obtained by retaining only the up-search function and optimization based on `grid_loose_quadtree.rs`. 
 
-`grid_loose_quadtree_original.rs` is the original idea of up-search quadtree, which achieves O(1) insertion on a regular (non-loose) quadtree by an O(1) lowest common ancestor finding approach. Although using the up-search method, there is basically no performance improvement. However, this file may be helpful in understanding the up-search method, as it is simpler than the current version.
+`up_search_quadtree_original.rs` is the original idea of up-search quadtree, which is based on a normal (non-loose) quadtree. It achieves O(1) insertion by an O(1) lowest common ancestor finding approach. Although using the up-search method, there is basically no performance improvement. However, this file may be helpful in understanding the up-search method, as it is simpler than the current version.
 
 ## Benchmark
 

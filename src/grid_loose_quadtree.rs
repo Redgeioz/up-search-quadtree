@@ -298,7 +298,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         let coord_x = (((x - offset_x) / node_width) as usize).min(grid_width - 1);
         let coord_y = (((y - offset_y) / node_height) as usize).min(grid_height - 1);
 
-        self.search_up_3x3::<true>((level, coord_x, coord_y), bounds, &mut callback);
+        self.search_up_3x3((level, coord_x, coord_y), bounds, &mut callback);
     }
 
     /// Search down and then up from the level where the search area is located.
@@ -341,7 +341,71 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         let coord_x = (((x - offset_x) / node_width) as usize).min(grid_width - 1);
         let coord_y = (((y - offset_y) / node_height) as usize).min(grid_height - 1);
 
-        self.search_up_3x3::<true>((level, coord_x, coord_y), bounds, &mut callback);
+        unsafe {
+            let (x, y) = (coord_x, coord_y);
+            let grid = &self.grids[level];
+            let grid_width = grid.cols();
+            let grid_height = grid.rows();
+
+            let node = &**grid.get_unchecked(y, x);
+            let (center_x, center_y) = node.loose_bounds.get_center();
+
+            if bounds.min_y < center_y && y != 0 {
+                if bounds.min_x < center_x && x != 0 {
+                    let node = &**grid.get_unchecked(y - 1, x - 1);
+                    node.search_down(bounds, &mut callback);
+                }
+
+                {
+                    let node = &**grid.get_unchecked(y - 1, x);
+                    node.search_down(bounds, &mut callback);
+                }
+
+                if bounds.max_x > center_x && x + 1 != grid_width {
+                    let node = &**grid.get_unchecked(y - 1, x + 1);
+                    node.search_down(bounds, &mut callback);
+                }
+            }
+
+            {
+                if bounds.min_x < center_x && x != 0 {
+                    let node = &**grid.get_unchecked(y, x - 1);
+                    node.search_down(bounds, &mut callback);
+                }
+
+                {
+                    node.search_down(bounds, &mut callback);
+                }
+
+                if bounds.max_x > center_x && x + 1 != grid_width {
+                    let node = &**grid.get_unchecked(y, x + 1);
+                    node.search_down(bounds, &mut callback);
+                }
+            }
+
+            if bounds.max_y > center_y && y + 1 != grid_height {
+                if bounds.min_x < center_x && x != 0 {
+                    let node = &**grid.get_unchecked(y + 1, x - 1);
+                    node.search_down(bounds, &mut callback);
+                }
+
+                {
+                    let node = &**grid.get_unchecked(y + 1, x);
+                    node.search_down(bounds, &mut callback);
+                }
+
+                if bounds.max_x > center_x && x + 1 != grid_width {
+                    let node = &**grid.get_unchecked(y + 1, x + 1);
+                    node.search_down(bounds, &mut callback);
+                }
+            }
+        }
+
+        self.search_up_3x3(
+            (level - 1, coord_x >> 1, coord_y >> 1),
+            bounds,
+            &mut callback,
+        );
     }
 
     /// Traditional method. Search from the top down.
@@ -350,20 +414,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         self.root.search_down(bounds, &mut callback);
     }
 
-    fn search_up_3x3<const DOWN: bool>(
-        &self,
-        position: Coord,
-        bounds: &Rectangle,
-        callback: &mut impl FnMut(T),
-    ) {
+    fn search_up_3x3(&self, position: Coord, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         let (level, mut x, mut y) = position;
-        let mut search = |node: &GridLooseQuadTreeNode<T>| {
-            if DOWN {
-                node.search_down(bounds, callback);
-            } else {
-                node.search_items(bounds, callback);
-            }
-        };
 
         self.grids[2..=level].iter().rev().for_each(|grid| unsafe {
             let grid_width = grid.cols();
@@ -375,50 +427,50 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
             if bounds.min_y < center_y && y != 0 {
                 if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y - 1, x - 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 {
                     let node = &**grid.get_unchecked(y - 1, x);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y - 1, x + 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
             }
 
             {
                 if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y, x - 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 {
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y, x + 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
             }
 
             if bounds.max_y > center_y && y + 1 != grid_height {
                 if bounds.min_x < center_x && x != 0 {
                     let node = &**grid.get_unchecked(y + 1, x - 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 {
                     let node = &**grid.get_unchecked(y + 1, x);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
 
                 if bounds.max_x > center_x && x + 1 != grid_width {
                     let node = &**grid.get_unchecked(y + 1, x + 1);
-                    search(node);
+                    node.search_items(bounds, callback);
                 }
             }
 

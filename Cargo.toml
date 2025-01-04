@@ -17,3 +17,8 @@ criterion = "0.5"
 [[bench]]
 name = "search"
 harness = false
+
+[workspace]
+members = [
+    "example",
+]

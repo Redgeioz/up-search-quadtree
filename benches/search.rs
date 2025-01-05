@@ -14,6 +14,7 @@ const BOUND_WIDTH: f64 = 20000.0;
 const BOUND_HEIGHT: f64 = 20000.0;
 
 const AMOUNT: usize = 10000;
+const SEED: u64 = 3;
 
 // level 9~10 size
 const MIN_RADIUS: f64 = 25.0;
@@ -81,7 +82,7 @@ fn gen_balls(quadtree: &mut impl QTree<usize>, count: usize, seed: u64) -> Vec<R
 
 fn quadtree(c: &mut Criterion) {
     let mut quadtree_normal = QuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_normal, AMOUNT, 3);
+    let bounds_cache = gen_balls(&mut quadtree_normal, AMOUNT, SEED);
 
     c.bench_function("QuadTree", |b| {
         b.iter(|| {
@@ -96,7 +97,7 @@ fn quadtree(c: &mut Criterion) {
 
 fn quadtree_loose(c: &mut Criterion) {
     let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_loose, AMOUNT, 3);
+    let bounds_cache = gen_balls(&mut quadtree_loose, AMOUNT, SEED);
 
     c.bench_function("GridLooseQuadTree", |b| {
         b.iter(|| {
@@ -111,7 +112,7 @@ fn quadtree_loose(c: &mut Criterion) {
 
 fn quadtree_us(c: &mut Criterion) {
     let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_us, AMOUNT, 3);
+    let bounds_cache = gen_balls(&mut quadtree_us, AMOUNT, SEED);
 
     c.bench_function("UpSearchQuadTree", |b| {
         b.iter(|| {
@@ -126,7 +127,7 @@ fn quadtree_us(c: &mut Criterion) {
 
 fn quadtree_uso(c: &mut Criterion) {
     let mut quadtree_uso = UpSearchQuadTreeOriginal::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_uso, AMOUNT, 3);
+    let bounds_cache = gen_balls(&mut quadtree_uso, AMOUNT, SEED);
 
     c.bench_function("UpSearchQuadTreeOriginal", |b| {
         b.iter(|| {

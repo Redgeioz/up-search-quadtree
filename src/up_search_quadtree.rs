@@ -2,8 +2,6 @@ use crate::rect::Rectangle;
 use grid::*;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::mem::transmute;
-use std::mem::MaybeUninit;
 
 type Coord = (usize, usize, usize);
 type Grids<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
@@ -68,7 +66,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let mut vec = Vec::with_capacity(rows * cols);
             for _ in 0..rows {
                 for _ in 0..cols {
-                    vec.push(MaybeUninit::<UpSearchQuadTreeNode<T>>::uninit());
+                    vec.push(UpSearchQuadTreeNode::new());
                 }
             }
             grids.push(Grid::from_vec(vec, cols));
@@ -76,33 +74,19 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         }
 
         // Determine the root bounds to use
-        let (center_x, center_y, root_bounds);
+        let root_bounds;
         if !FIT {
             let len = root_width.max(root_height);
             root_width = len;
             root_height = len;
 
             let (min_x, min_y) = world_bounds.get_min();
-            center_x = min_x + len * 0.5;
-            center_y = min_y + len * 0.5;
+            let center_x = min_x + len * 0.5;
+            let center_y = min_y + len * 0.5;
             root_bounds = Rectangle::center_rect(center_x, center_y, root_width, root_height)
         } else {
-            (center_x, center_y) = world_bounds.get_center();
             root_bounds = world_bounds.clone();
         }
-
-        // Initialize all nodes
-        let root = UpSearchQuadTreeNode::new(center_x, center_y);
-        root.split(
-            &mut grids,
-            (1, 0, 0),
-            root_width,
-            root_height,
-            MAX_LEVEL as usize,
-        );
-        grids[1][0][0].write(root);
-
-        let grids = unsafe { transmute::<_, Grids<T>>(grids) };
 
         UpSearchQuadTree {
             grids,
@@ -290,31 +274,34 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             return;
         }
 
-        let (x, y) = bounds.get_center();
+        self.search_up_3x3(level, bounds, &mut callback);
+    }
 
-        let grid = grids.get(level).unwrap();
+    fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        let (bx, by) = bounds.get_center();
+        let grid = self.grids.get(level).unwrap();
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
         let edge_max_node_num = grid_width.max(grid_height) as f64;
-        let node_width = root_width / edge_max_node_num;
-        let node_height = root_height / edge_max_node_num;
 
-        let coord_x = (((x - offset_x) / node_width) as usize).min(grid_width - 1);
-        let coord_y = (((y - offset_y) / node_height) as usize).min(grid_height - 1);
+        let root_bounds = &self.root_bounds;
+        let (offset_x, offset_y) = root_bounds.get_min();
+        let root_width = root_bounds.get_width();
+        let root_height = root_bounds.get_height();
 
-        self.search_up_3x3((level, coord_x, coord_y), bounds, &mut callback);
-    }
+        let mut node_width = root_width / edge_max_node_num;
+        let mut node_height = root_height / edge_max_node_num;
 
-    fn search_up_3x3(&self, position: Coord, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
-        let (level, mut x, mut y) = position;
+        let mut x = (((bx - offset_x) / node_width) as usize).min(grid_width - 1);
+        let mut y = (((by - offset_y) / node_height) as usize).min(grid_height - 1);
 
         self.grids[2..=level].iter().rev().for_each(|grid| unsafe {
             let grid_width = grid.cols();
             let grid_height = grid.rows();
 
-            let node = grid.get_unchecked(y, x);
-            let (center_x, center_y) = node.get_center();
+            let center_x = offset_x + node_width * (x as f64 + 0.5);
+            let center_y = offset_y + node_height * (y as f64 + 0.5);
 
             if bounds.min_y < center_y && y != 0 {
                 if bounds.min_x < center_x && x != 0 {
@@ -340,6 +327,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                 }
 
                 {
+                    let node = grid.get_unchecked(y, x);
                     node.search_items(bounds, callback);
                 }
 
@@ -366,8 +354,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                 }
             }
 
-            x >>= 1;
-            y >>= 1;
+            node_width *= 2.0;
+            node_height *= 2.0;
+            x /= 2;
+            y /= 2;
         });
 
         self.get_root().search_items(bounds, callback);
@@ -375,22 +365,12 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
 }
 
 struct UpSearchQuadTreeNode<T: Copy + Eq> {
-    center_x: f64,
-    center_y: f64,
     items: Vec<(Rectangle, T)>,
 }
 
 impl<T: Copy + Eq> UpSearchQuadTreeNode<T> {
-    fn new(center_x: f64, center_y: f64) -> Self {
-        Self {
-            center_x,
-            center_y,
-            items: Vec::new(),
-        }
-    }
-
-    fn get_center(&self) -> (f64, f64) {
-        (self.center_x, self.center_y)
+    fn new() -> Self {
+        Self { items: Vec::new() }
     }
 
     fn add(&mut self, bounds: Rectangle, item: T) {
@@ -415,74 +395,6 @@ impl<T: Copy + Eq> UpSearchQuadTreeNode<T> {
             .expect("Item not found.");
 
         self.items.remove(i);
-    }
-
-    /// Initialize all nodes at once
-    fn split(
-        &self,
-        grids: &mut Vec<Grid<MaybeUninit<Self>>>,
-        position: Coord,
-        root_width: f64,
-        root_height: f64,
-        max_level: usize,
-    ) {
-        let (level, coord_x, coord_y) = position;
-        if level >= max_level {
-            return;
-        }
-
-        // The edge node number of next level
-        let edge_node_num = (1 << level) as f64;
-
-        let (center_x, center_y) = self.get_center();
-
-        // wh of real bounds of child nodes
-        let width = root_width / edge_node_num;
-        let height = root_height / edge_node_num;
-
-        let offset_x = width / 2.0;
-        let offset_y = height / 2.0;
-
-        for i in 0..4 {
-            #[rustfmt::skip]
-            let sign_x = ((i &  1) * 2) as f64 - 1.0;
-            let sign_y = ((i >> 1) * 2) as f64 - 1.0;
-
-            let node = UpSearchQuadTreeNode::new(
-                center_x + sign_x * offset_x,
-                center_y + sign_y * offset_y,
-            );
-
-            // Calculate the coordinates of child nodes.
-            //   i   |  i & 1  |  i >> 1 |
-            // ——————|—————————|—————————|
-            //  0b00 |    0    |    0    |
-            //  0b01 |    1    |    0    |
-            //  0b10 |    0    |    1    |
-            //  0b11 |    1    |    1    |
-            // ——————|—————————|—————————|
-            #[rustfmt::skip]
-            let coord_x = (coord_x << 1) + (i &  1);
-            let coord_y = (coord_y << 1) + (i >> 1);
-
-            let next_level = level + 1;
-
-            if grids
-                .get(next_level)
-                .unwrap()
-                .get(coord_y, coord_x)
-                .is_some()
-            {
-                node.split(
-                    grids,
-                    (next_level, coord_x, coord_y),
-                    root_width,
-                    root_height,
-                    max_level,
-                );
-                grids[next_level][coord_y][coord_x].write(node);
-            }
-        }
     }
 
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {

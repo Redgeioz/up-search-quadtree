@@ -23,7 +23,7 @@ fn check_quadtrees() {
 }
 
 fn single_check() {
-    let bounds = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
+    let bounds = Rectangle::new(-128.0, -128.0, BOUND_WIDTH - 128.0, BOUND_HEIGHT - 128.0);
     let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(bounds.clone());
     let mut quadtree_normal = QuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(bounds.clone());
@@ -54,7 +54,7 @@ fn single_check() {
         balls.push(ball);
         quadtree_loose.insert(bounds.clone(), id);
         quadtree_us.insert(bounds.clone(), id);
-        quadtree_normal.insert(bounds, id);
+        quadtree_normal.insert(bounds.clone(), id);
     }
 
     balls.iter().enumerate().for_each(|(id, ball)| {
@@ -121,5 +121,10 @@ fn single_check() {
             assert!(set_4.contains(&other_id));
             assert!(set_5.contains(&other_id));
         });
+
+        assert!(set_1.len() == set_2.len());
+        assert!(set_2.len() == set_3.len());
+        assert!(set_3.len() == set_4.len());
+        assert!(set_4.len() == set_5.len());
     });
 }

@@ -19,10 +19,10 @@ fn find_common(a: usize, b: usize) -> (usize, usize) {
 }
 
 type Coord = (usize, usize, usize);
-type Grids<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
+type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 
 pub struct UpSearchQuadTreeOriginal<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
-    grids: Grids<T>,
+    layers: Layers<T>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     items: HashMap<T, Coord>,
@@ -54,8 +54,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let mut root_width = world_bounds.get_width();
         let mut root_height = world_bounds.get_height();
 
-        // Initialize grids
-        let mut grids = Vec::with_capacity(MAX_LEVEL as usize + 1);
+        // Initialize layers
+        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
         let mut size = 0;
         for n in 0..=MAX_LEVEL {
             let (mut rows, mut cols) = (size, size);
@@ -72,7 +72,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
                     vec.push(UpSearchQuadTreeNode::new());
                 }
             }
-            grids.push(Grid::from_vec(vec, cols));
+            layers.push(Grid::from_vec(vec, cols));
             size = 1 << n;
         }
 
@@ -92,7 +92,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         }
 
         UpSearchQuadTreeOriginal {
-            grids,
+            layers,
             root_bounds,
             world_bounds,
             items: HashMap::new(),
@@ -117,7 +117,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let (offset_x, offset_y) = root_bounds.get_min();
 
         let max_level = MAX_LEVEL as usize;
-        let grid = self.grids.get(max_level).unwrap();
+        let grid = self.layers.get(max_level).unwrap();
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
@@ -165,11 +165,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
     }
 
     fn get_root(&self) -> &UpSearchQuadTreeNode<T> {
-        unsafe { self.grids.get_unchecked(1).get_unchecked(0, 0) }
+        unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
     fn get_node_mut(&mut self, level: usize, x: usize, y: usize) -> &mut UpSearchQuadTreeNode<T> {
-        &mut self.grids[level][y][x]
+        &mut self.layers[level][y][x]
     }
 
     /// Insert an item into the quadtree.
@@ -219,8 +219,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let (nl, nx, ny) = curt_coord;
         let (ol, ox, oy) = prev_coord;
 
-        self.grids[ol][oy][ox].remove(item);
-        self.grids[nl][ny][nx].add(bounds, item);
+        self.layers[ol][oy][ox].remove(item);
+        self.layers[nl][ny][nx].add(bounds, item);
     }
 
     /// Search from the bottom up. Execute the callback function for each item found.
@@ -236,7 +236,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let (offset_x, offset_y) = root_bounds.get_min();
 
         let max_level = MAX_LEVEL as usize;
-        let grid = self.grids.get(max_level).unwrap();
+        let grid = self.layers.get(max_level).unwrap();
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
@@ -259,9 +259,9 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let shift_steps = shift_steps_x.max(shift_steps_y);
         let level = max_level - shift_steps;
 
-        let grids = &self.grids;
+        let layers = &self.layers;
         if level != max_level {
-            grids[level + 1..=max_level].iter().rev().for_each(|grid| {
+            layers[level + 1..=max_level].iter().rev().for_each(|grid| {
                 for y in min_coord_y..=max_coord_y {
                     for x in min_coord_x..=max_coord_x {
                         let node = unsafe { grid.get_unchecked(y, x) };
@@ -286,7 +286,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let mut coord_x = min_coord_x;
         let mut coord_y = min_coord_y;
 
-        self.grids[1..=level].iter().rev().for_each(|grid| unsafe {
+        self.layers[1..=level].iter().rev().for_each(|grid| unsafe {
             grid.get_unchecked(coord_y, coord_x)
                 .search_items(bounds, &mut callback);
 

@@ -14,7 +14,7 @@ const BOUND_WIDTH: f64 = 20000.0;
 const BOUND_HEIGHT: f64 = 20000.0;
 
 const AMOUNT: usize = 10000;
-const SEED: u64 = 3;
+const SEED: u64 = 0;
 
 // level 9~10 size
 const MIN_RADIUS: f64 = 25.0;
@@ -28,6 +28,14 @@ trait QTree<T> {
 
 impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     for QuadTree<T, MAX_LEVEL, MAX_ITEMS>
+{
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+}
+
+impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
+    for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
@@ -96,13 +104,28 @@ fn quadtree(c: &mut Criterion) {
 }
 
 fn quadtree_loose(c: &mut Criterion) {
-    let mut quadtree_loose = GridLooseQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let mut quadtree_loose = LooseQuadTree::<usize, MAX_LEVEL, 8>::new(BOUNDS.clone());
     let bounds_cache = gen_balls(&mut quadtree_loose, AMOUNT, SEED);
+
+    c.bench_function("LooseQuadTree", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                quadtree_loose.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn quadtree_gl(c: &mut Criterion) {
+    let mut quadtree_gl = GridLooseQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut quadtree_gl, AMOUNT, SEED);
 
     c.bench_function("GridLooseQuadTree", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
-                quadtree_loose.search(bounds, |id| {
+                quadtree_gl.search(bounds, |id| {
                     black_box(id);
                 });
             });
@@ -140,5 +163,5 @@ fn quadtree_uso(c: &mut Criterion) {
     });
 }
 
-criterion_group!(bench, quadtree, quadtree_loose, quadtree_us);
+criterion_group!(bench, quadtree, quadtree_loose, quadtree_gl, quadtree_us);
 criterion_main!(bench);

@@ -4,22 +4,17 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 type Coord = (usize, usize, usize);
-type Grids<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
+type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 
-/// An optimized [`GridLooseQuadTree`] retaining only the up-search function
+/// Optimized [`GridLooseQuadTree`] retaining only the up-search function.
 ///
-/// One change is to store all nodes in grids to speed up the search by continuous memory data
-/// layout. Although, for the traditional branch search method, it causes the four child nodes
-/// of a parent node to be non-contiguous in memory layout, thus slowing down the search. The
-/// up-search method, which traverses the entire possible range at each level, does not face
-/// this problem.
-///
-/// Another change is to store only the center of the bounds on each node, as opposed to the
-/// entire rectangle, which can reduce the size of each node.
+/// The main change is to store only the items on each node to reduce the size of each node.
+/// As the up-search method does not rely on intersection check of nodes, there is no need to
+/// store the bounds of each node.
 ///
 /// [`GridLooseQuadTree`]: crate::grid_loose_quadtree::GridLooseQuadTree
 pub struct UpSearchQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
-    grids: Grids<T>,
+    layers: Layers<T>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     items: HashMap<T, Coord>,
@@ -51,8 +46,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let mut root_width = world_bounds.get_width();
         let mut root_height = world_bounds.get_height();
 
-        // Initialize grids
-        let mut grids = Vec::with_capacity(MAX_LEVEL as usize + 1);
+        // Initialize layers
+        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
         let mut size = 0;
         for n in 0..=MAX_LEVEL {
             let (mut rows, mut cols) = (size, size);
@@ -69,7 +64,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                     vec.push(UpSearchQuadTreeNode::new());
                 }
             }
-            grids.push(Grid::from_vec(vec, cols));
+            layers.push(Grid::from_vec(vec, cols));
             size = 1 << n;
         }
 
@@ -89,7 +84,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         }
 
         UpSearchQuadTree {
-            grids,
+            layers,
             root_bounds,
             world_bounds,
             items: HashMap::new(),
@@ -128,7 +123,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let (x, y) = bounds.get_center();
         let (offset_x, offset_y) = root_bounds.get_min();
 
-        let grid = self.grids.get(level).unwrap();
+        let grid = self.layers.get(level).unwrap();
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
@@ -143,11 +138,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     }
 
     fn get_root(&self) -> &UpSearchQuadTreeNode<T> {
-        unsafe { self.grids.get_unchecked(1).get_unchecked(0, 0) }
+        unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
     fn get_node_mut(&mut self, level: usize, x: usize, y: usize) -> &mut UpSearchQuadTreeNode<T> {
-        &mut self.grids[level][y][x]
+        &mut self.layers[level][y][x]
     }
 
     /// Insert an item into the quadtree.
@@ -197,8 +192,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let (nl, nx, ny) = curt_coord;
         let (ol, ox, oy) = prev_coord;
 
-        self.grids[ol][oy][ox].remove(item);
-        self.grids[nl][ny][nx].add(bounds, item);
+        self.layers[ol][oy][ox].remove(item);
+        self.layers[nl][ny][nx].add(bounds, item);
     }
 
     /// Search from the bottom up. Execute the callback function for each item found.
@@ -221,7 +216,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
 
         let (offset_x, offset_y) = root_bounds.get_min();
 
-        let grids = &self.grids;
+        let layers = &self.layers;
         if level != max_level {
             // top left
             let min_x = bounds.min_x - offset_x;
@@ -235,7 +230,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let calc_max = |n: f64| (n + 0.5).trunc() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
-            grids[level + 1..=max_level].iter().rev().for_each(|grid| {
+            layers[level + 1..=max_level].iter().rev().for_each(|grid| {
                 let grid_width = grid.cols();
                 let grid_height = grid.rows();
 
@@ -279,7 +274,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
 
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         let (bx, by) = bounds.get_center();
-        let grid = self.grids.get(level).unwrap();
+        let grid = self.layers.get(level).unwrap();
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
@@ -296,7 +291,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let mut x = (((bx - offset_x) / node_width) as usize).min(grid_width - 1);
         let mut y = (((by - offset_y) / node_height) as usize).min(grid_height - 1);
 
-        self.grids[2..=level].iter().rev().for_each(|grid| unsafe {
+        self.layers[2..=level].iter().rev().for_each(|grid| unsafe {
             let grid_width = grid.cols();
             let grid_height = grid.rows();
 
@@ -364,7 +359,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     }
 }
 
-struct UpSearchQuadTreeNode<T: Copy + Eq> {
+pub struct UpSearchQuadTreeNode<T: Copy + Eq> {
     items: Vec<(Rectangle, T)>,
 }
 

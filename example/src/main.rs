@@ -67,7 +67,7 @@ fn setup(mut commands: Commands) {
         let id = balls.len();
         let bounds = ball.get_bounds();
         balls.push(ball);
-        quadtree.insert(bounds, id);
+        quadtree.insert(bounds.clone(), id);
     }
 
     let mut camera = Camera2dBundle::default();

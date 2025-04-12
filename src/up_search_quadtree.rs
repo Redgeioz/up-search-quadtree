@@ -69,8 +69,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         }
 
         // Determine the root bounds to use
-        let root_bounds;
-        if !FIT {
+        let root_bounds = if !FIT {
             let len = root_width.max(root_height);
             root_width = len;
             root_height = len;
@@ -78,10 +77,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let (min_x, min_y) = world_bounds.get_min();
             let center_x = min_x + len * 0.5;
             let center_y = min_y + len * 0.5;
-            root_bounds = Rectangle::center_rect(center_x, center_y, root_width, root_height)
+            Rectangle::center_rect(center_x, center_y, root_width, root_height)
         } else {
-            root_bounds = world_bounds.clone();
-        }
+            world_bounds.clone()
+        };
 
         UpSearchQuadTree {
             layers,
@@ -202,6 +201,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     ///
     /// [`GridLooseQuadTree::search_up`]: crate::grid_loose_quadtree::GridLooseQuadTree::search_up
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        if !self.world_bounds.contains_point(bounds.get_center()) {
+            self.get_root().search_items(bounds, &mut callback);
+            return;
+        }
+
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;
@@ -226,8 +230,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let max_x = bounds.max_x - offset_x;
             let max_y = bounds.max_y - offset_y;
 
-            let calc_min = |n: f64| ((n + 0.5).trunc() - 1.0) as usize;
-            let calc_max = |n: f64| (n + 0.5).trunc() as usize;
+            let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
+            let calc_max = |n: f64| n.round() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
             layers[level + 1..=max_level].iter().rev().for_each(|grid| {
@@ -238,8 +242,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                 let node_width = root_width / edge_max_node_num;
                 let node_height = root_height / edge_max_node_num;
 
-                let min_coord_x = (calc_min(min_x / node_width)).min(grid_width - 1);
-                let min_coord_y = (calc_min(min_y / node_height)).min(grid_height - 1);
+                let min_coord_x = calc_min(min_x / node_width);
+                let min_coord_y = calc_min(min_y / node_height);
 
                 let max_coord_x = (calc_max(max_x / node_width)).min(grid_width - 1);
                 let max_coord_y = (calc_max(max_y / node_height)).min(grid_height - 1);
@@ -248,6 +252,9 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                 for y in min_coord_y..=max_coord_y {
                     for x in min_coord_x..=max_coord_x {
                         let node = unsafe { grid.get_unchecked(y, x) };
+                        if node.items.is_empty() {
+                            continue;
+                        }
 
                         if y > min_coord_y + 1
                             && y < max_coord_y - 1

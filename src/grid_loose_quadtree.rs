@@ -3,7 +3,6 @@ use crate::rect::Rectangle;
 use grid::*;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::mem::{transmute, MaybeUninit};
 
 type Coord = (usize, usize, usize);
 type Layers<T> = Vec<Grid<GridLooseQuadTreeNode<T>>>;
@@ -42,6 +41,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         let mut root_width = world_bounds.get_width();
         let mut root_height = world_bounds.get_height();
 
+        let (offset_x, offset_y) = world_bounds.get_min();
+
         // Initialize layers
         let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
         let mut size = 0;
@@ -55,9 +56,15 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
                 }
             }
             let mut vec = Vec::with_capacity(rows * cols);
-            for _ in 0..rows {
-                for _ in 0..cols {
-                    vec.push(MaybeUninit::<GridLooseQuadTreeNode<T>>::uninit());
+            let w = root_width / cols as f64;
+            let h = root_height / rows as f64;
+            for y in 0..rows {
+                for x in 0..cols {
+                    let cx = offset_x + (x as f64 + 0.5) * w;
+                    let cy = offset_y + (y as f64 + 0.5) * h;
+                    let looseness = 2.0;
+                    let rect = Rectangle::center_rect(cx, cy, w, h).scale(looseness);
+                    vec.push(GridLooseQuadTreeNode::new(rect));
                 }
             }
             layers.push(Grid::from_vec(vec, cols));
@@ -77,15 +84,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         } else {
             world_bounds.clone()
         };
-
-        let looseness = 2.0;
-        let loose_bounds = root_bounds.scale(looseness);
-
-        let root = GridLooseQuadTreeNode::new(loose_bounds);
-        root.split(&mut layers, (1, 0, 0), MAX_LEVEL as usize);
-        layers[1][0][0].write(root);
-
-        let layers = unsafe { transmute::<_, Layers<T>>(layers) };
 
         GridLooseQuadTree {
             root_bounds,
@@ -214,6 +212,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     ///
     /// [`search_bidirectional`]: GridLooseQuadTree::search_bidirectional
     pub fn search_up(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        if !self.world_bounds.contains_point(bounds.get_center()) {
+            self.get_root().search_items(bounds, &mut callback);
+            return;
+        }
+
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;
@@ -238,8 +241,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
             let max_x = bounds.max_x - offset_x;
             let max_y = bounds.max_y - offset_y;
 
-            let calc_min = |n: f64| ((n + 0.5).trunc() - 1.0) as usize;
-            let calc_max = |n: f64| (n + 0.5).trunc() as usize;
+            let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
+            let calc_max = |n: f64| n.round() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
             layers[level + 1..=max_level].iter().rev().for_each(|grid| {
@@ -309,6 +312,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     /// so we only need to check 3x3 areas centered on this path. This skips a lot
     /// of conditional judgments. For the remainder, use the traditional method.
     pub fn search_bidirectional(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        if !self.world_bounds.contains_point(bounds.get_center()) {
+            self.get_root().search_items(bounds, &mut callback);
+            return;
+        }
+
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;
@@ -497,10 +505,10 @@ impl<T: Copy + Eq> GridLooseQuadTreeNode<T> {
         }
     }
 
-    fn get_children<'a>(
+    fn get_children(
         coord: Coord,
-        layers: &'a Layers<T>,
-    ) -> [Option<(&'a GridLooseQuadTreeNode<T>, Coord)>; 4] {
+        layers: &Layers<T>,
+    ) -> [Option<(&GridLooseQuadTreeNode<T>, Coord)>; 4] {
         let (mut level, x, y) = coord;
 
         level += 1;
@@ -541,62 +549,6 @@ impl<T: Copy + Eq> GridLooseQuadTreeNode<T> {
         self.items.remove(i);
     }
 
-    /// Initialize all nodes at once
-    fn split(&self, layers: &mut Vec<Grid<MaybeUninit<Self>>>, position: Coord, max_level: usize) {
-        let (level, coord_x, coord_y) = position;
-        if level >= max_level {
-            return;
-        }
-
-        let looseness = 2.0;
-        let (center_x, center_y) = self.loose_bounds.get_center();
-
-        // wh of loose bounds of child nodes
-        let width = self.loose_bounds.get_width() / 2.0;
-        let height = self.loose_bounds.get_height() / 2.0;
-
-        let offset_x = width / looseness / 2.0;
-        let offset_y = height / looseness / 2.0;
-
-        for i in 0..4 {
-            #[rustfmt::skip]
-            let sign_x = ((i &  1) * 2) as f64 - 1.0;
-            let sign_y = ((i >> 1) * 2) as f64 - 1.0;
-
-            let rect = Rectangle::center_rect(
-                center_x + sign_x * offset_x,
-                center_y + sign_y * offset_y,
-                width,
-                height,
-            );
-            let node = GridLooseQuadTreeNode::new(rect);
-
-            // Calculate the coordinates of child nodes.
-            //   i   |  i & 1  |  i >> 1 |
-            // ——————|—————————|—————————|
-            //  0b00 |    0    |    0    |
-            //  0b01 |    1    |    0    |
-            //  0b10 |    0    |    1    |
-            //  0b11 |    1    |    1    |
-            // ——————|—————————|—————————|
-            #[rustfmt::skip]
-            let coord_x = (coord_x << 1) + (i &  1);
-            let coord_y = (coord_y << 1) + (i >> 1);
-
-            let next_level = level + 1;
-
-            if layers
-                .get(next_level)
-                .unwrap()
-                .get(coord_y, coord_x)
-                .is_some()
-            {
-                node.split(layers, (next_level, coord_x, coord_y), max_level);
-                layers[next_level][coord_y][coord_x].write(node);
-            }
-        }
-    }
-
     fn search_down(
         &self,
         bounds: &Rectangle,
@@ -606,14 +558,11 @@ impl<T: Copy + Eq> GridLooseQuadTreeNode<T> {
     ) {
         let children = Self::get_children(coord, layers);
 
-        children
-            .into_iter()
-            .filter_map(|c| c)
-            .for_each(|(child, coord)| {
-                if child.loose_bounds.intersects(bounds) {
-                    child.search_down(bounds, coord, layers, callback);
-                }
-            });
+        children.into_iter().flatten().for_each(|(child, coord)| {
+            if child.loose_bounds.intersects(bounds) {
+                child.search_down(bounds, coord, layers, callback);
+            }
+        });
 
         self.search_items(bounds, callback);
     }

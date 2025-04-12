@@ -163,5 +163,5 @@ fn quadtree_uso(c: &mut Criterion) {
     });
 }
 
-criterion_group!(bench, quadtree, quadtree_loose, quadtree_gl, quadtree_us);
+criterion_group!(bench, quadtree, quadtree_loose, quadtree_us);
 criterion_main!(bench);

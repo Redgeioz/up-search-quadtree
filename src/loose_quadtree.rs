@@ -86,6 +86,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         node.remove(item);
 
         self.items.remove(&item);
+        LooseQuadTree::merge(node);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the LooseQuadTree.

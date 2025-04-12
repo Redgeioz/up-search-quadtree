@@ -77,8 +77,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         }
 
         // Determine the root bounds to use
-        let root_bounds;
-        if !FIT {
+        let root_bounds = if !FIT {
             let len = root_width.max(root_height);
             root_width = len;
             root_height = len;
@@ -86,10 +85,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
             let (min_x, min_y) = world_bounds.get_min();
             let center_x = min_x + len * 0.5;
             let center_y = min_y + len * 0.5;
-            root_bounds = Rectangle::center_rect(center_x, center_y, root_width, root_height)
+            Rectangle::center_rect(center_x, center_y, root_width, root_height)
         } else {
-            root_bounds = world_bounds.clone();
-        }
+            world_bounds.clone()
+        };
 
         UpSearchQuadTreeOriginal {
             layers,

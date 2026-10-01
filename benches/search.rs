@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::*;
 use std::hash::Hash;
 use std::hint::black_box;
@@ -125,7 +125,7 @@ fn quadtree_gl(c: &mut Criterion) {
     c.bench_function("GridLooseQuadTree", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
-                quadtree_gl.search(bounds, |id| {
+                quadtree_gl.search_up(bounds, |id| {
                     black_box(id);
                 });
             });
@@ -163,5 +163,12 @@ fn quadtree_uso(c: &mut Criterion) {
     });
 }
 
-criterion_group!(bench, quadtree, quadtree_loose, quadtree_us);
+criterion_group!(
+    bench,
+    quadtree,
+    quadtree_uso,
+    quadtree_loose,
+    quadtree_gl,
+    quadtree_us
+);
 criterion_main!(bench);

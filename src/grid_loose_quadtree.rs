@@ -4,6 +4,9 @@ use grid::*;
 use std::collections::HashMap;
 use std::hash::Hash;
 
+/// (level, x, y, i)
+type Location = (usize, usize, usize, usize);
+/// (level, x, y)
 type Coord = (usize, usize, usize);
 type Layers<T> = Vec<Grid<GridLooseQuadTreeNode<T>>>;
 
@@ -12,7 +15,7 @@ pub struct GridLooseQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     pub layers: Layers<T>,
-    items: HashMap<T, Coord>,
+    items: HashMap<T, Location>,
 }
 
 impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
@@ -153,22 +156,35 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     /// by computation, instead of by judgment at each node.
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> Coord {
         let coord = self.position(&bounds);
-        self.items.insert(item, coord);
 
         let (level, x, y) = coord;
         let node = self.get_node_mut(level, x, y);
 
+        let location = (coord.0, coord.1, coord.2, node.items.len());
         node.add(bounds, item);
+        self.items.insert(item, location);
         coord
     }
 
     /// Remove an item from the quadtree.
     pub fn remove(&mut self, item: T) {
-        let coord = self.items.get(&item).expect("Removal item not found.");
-        let (level, x, y) = *coord;
+        let location = self.items.get(&item).expect("Removal item not found.");
+        let (level, x, y, i) = *location;
         let node = self.get_node_mut(level, x, y);
 
-        node.remove(item);
+        assert!(
+            node.items[i].1 == item,
+            "Item not found at the expected location."
+        );
+
+        let last_idx = node.items.len() - 1;
+        if i != last_idx {
+            node.items.swap_remove(i);
+            let moved_item = node.items[i].1.clone();
+            self.items.get_mut(&moved_item).unwrap().3 = i;
+        } else {
+            node.items.pop();
+        }
 
         self.items.remove(&item);
     }
@@ -176,26 +192,36 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     /// Update the bounds of an item and, if necessary, its position in the quadtree.
     pub fn update(&mut self, bounds: Rectangle, item: T) {
         let curt_coord = self.position(&bounds);
-        let prev_coord = self.items.get_mut(&item).expect("Update item not found.");
+        let prev_location = self.items.get_mut(&item).expect("Update item not found.");
+        let (level, x, y, i) = *prev_location;
+        let prev_coord = (level, x, y);
 
-        if curt_coord == *prev_coord {
-            let (level, x, y) = *prev_coord;
-            self.get_node_mut(level, x, y).update(bounds, item);
+        if curt_coord == prev_coord {
+            self.get_node_mut(level, x, y).update(bounds, i);
             return;
         }
-
-        let prev_coord = {
-            let prev = *prev_coord;
-            *prev_coord = curt_coord;
-
-            prev
-        };
 
         let (nl, nx, ny) = curt_coord;
         let (ol, ox, oy) = prev_coord;
 
-        self.layers[ol][oy][ox].remove(item);
-        self.layers[nl][ny][nx].add(bounds, item);
+        let new_node = &mut self.layers[nl][ny][nx];
+
+        prev_location.0 = nl;
+        prev_location.1 = nx;
+        prev_location.2 = ny;
+        prev_location.3 = new_node.items.len();
+
+        new_node.add(bounds, item);
+
+        let old_node = &mut self.layers[ol][oy][ox];
+        let last_idx = old_node.items.len() - 1;
+        if i != last_idx {
+            old_node.items.swap_remove(i);
+            let moved_item = old_node.items[i].1.clone();
+            self.items.get_mut(&moved_item).unwrap().3 = i;
+        } else {
+            old_node.items.pop();
+        }
     }
 
     /// Search from the bottom up. Execute the callback function for each item found.
@@ -529,24 +555,9 @@ impl<T: Copy + Eq> GridLooseQuadTreeNode<T> {
         self.items.push((bounds, item));
     }
 
-    fn update(&mut self, bounds: Rectangle, item: T) {
-        let (b, _) = self
-            .items
-            .iter_mut()
-            .find(|(_, stored)| *stored == item)
-            .expect("Item not found");
-
+    fn update(&mut self, bounds: Rectangle, index: usize) {
+        let (b, _) = &mut self.items[index];
         *b = bounds;
-    }
-
-    fn remove(&mut self, item: T) {
-        let i = self
-            .items
-            .iter()
-            .position(|(_, stored)| *stored == item)
-            .expect("Item not found.");
-
-        self.items.remove(i);
     }
 
     fn search_down(

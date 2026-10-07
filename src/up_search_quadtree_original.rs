@@ -127,16 +127,25 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let node_width = root_width / edge_max_node_num;
         let node_height = root_height / edge_max_node_num;
 
-        let calc_coord_x = |x: f64| (((x - offset_x) / node_width) as usize).min(grid_width - 1);
-        let calc_coord_y = |y: f64| (((y - offset_y) / node_height) as usize).min(grid_height - 1);
+        // top left
+        let min_x = bounds.min_x - offset_x;
+        let min_y = bounds.min_y - offset_y;
+
+        // bottom right
+        let max_x = bounds.max_x - offset_x;
+        let max_y = bounds.max_y - offset_y;
 
         // Find the coordinates of the nodes where the top left and bottom right
         // of the given region are located at the max level respectively
-        let min_coord_x = calc_coord_x(bounds.min_x);
-        let min_coord_y = calc_coord_y(bounds.min_y);
+        let min_coord_x = ((min_x / node_width) as usize).min(grid_width - 1);
+        let min_coord_y = ((min_y / node_height) as usize).min(grid_height - 1);
 
-        let max_coord_x = calc_coord_x(bounds.max_x);
-        let max_coord_y = calc_coord_y(bounds.max_y);
+        let max_coord_x = ((max_x / node_width).ceil() as usize)
+            .saturating_sub(1)
+            .min(grid_width - 1);
+        let max_coord_y = ((max_y / node_height).ceil() as usize)
+            .saturating_sub(1)
+            .min(grid_height - 1);
 
         // The next step is a process of finding the lowest common ancestor of the two nodes.
         // Constantly calculate the value of these two coordinates at the upper level and compare
@@ -269,14 +278,25 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         let node_width = root_width / edge_max_node_num;
         let node_height = root_height / edge_max_node_num;
 
-        let calc_coord_x = |x: f64| (((x - offset_x) / node_width) as usize).min(grid_width - 1);
-        let calc_coord_y = |y: f64| (((y - offset_y) / node_height) as usize).min(grid_height - 1);
+        // top left
+        let min_x = bounds.min_x - offset_x;
+        let min_y = bounds.min_y - offset_y;
 
-        let mut min_coord_x = calc_coord_x(bounds.min_x);
-        let mut min_coord_y = calc_coord_y(bounds.min_y);
+        // bottom right
+        let max_x = bounds.max_x - offset_x;
+        let max_y = bounds.max_y - offset_y;
 
-        let mut max_coord_x = calc_coord_x(bounds.max_x);
-        let mut max_coord_y = calc_coord_y(bounds.max_y);
+        // Find the coordinates of the nodes where the top left and bottom right
+        // of the given region are located at the max level respectively
+        let mut min_coord_x = ((min_x / node_width) as usize).min(grid_width - 1);
+        let mut min_coord_y = ((min_y / node_height) as usize).min(grid_height - 1);
+
+        let mut max_coord_x = ((max_x / node_width).ceil() as usize)
+            .saturating_sub(1)
+            .min(grid_width - 1);
+        let mut max_coord_y = ((max_y / node_height).ceil() as usize)
+            .saturating_sub(1)
+            .min(grid_height - 1);
 
         let (_, shift_steps_x) = find_common(min_coord_x, max_coord_x);
         let (_, shift_steps_y) = find_common(min_coord_y, max_coord_y);

@@ -257,7 +257,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let max_y = bounds.max_y - offset_y;
 
             let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
-            let calc_max = |n: f64| n.round() as usize;
+            let calc_max = |n: f64| (n - 0.5).ceil() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
             layers[level + 1..=max_level].iter().rev().for_each(|grid| {

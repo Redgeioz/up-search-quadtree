@@ -41,8 +41,6 @@ cargo bench
 
 The following results were previously recorded for 10,000 searches among 10,000 balls of different sizes, using each ball's bounding rectangle as the query:
 
-| QuadTree | GridLooseQuadTree | UpSearchQuadTree |
-|:--------:|:-----------------:|:----------------:|
-| 7.08 ms  | 4.79 ms           | 2.82 ms          |
-
-Of these, the first two results are obtained using the traditional method.
+| QuadTree | LooseQuadTree | UpSearchQuadTree |
+|:--------:|:-------------:|:----------------:|
+| 4.62 ms  | 3.36 ms       | 2.28 ms          |

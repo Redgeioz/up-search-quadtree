@@ -46,8 +46,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             "`MAX_LEVEL` is too large and will cause overflow."
         );
 
-        let mut root_width = world_bounds.get_width();
-        let mut root_height = world_bounds.get_height();
+        let world_width = world_bounds.get_width();
+        let world_height = world_bounds.get_height();
 
         // Initialize layers
         let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
@@ -55,10 +55,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         for n in 0..=MAX_LEVEL {
             let (mut rows, mut cols) = (size, size);
             if !FIT {
-                if root_width > root_height {
-                    rows = (size as f64 * root_height / root_width).ceil() as usize;
-                } else if root_height > root_width {
-                    cols = (size as f64 / root_height * root_width).ceil() as usize;
+                if world_width > world_height {
+                    rows = (size as f64 * world_height / world_width).ceil() as usize;
+                } else if world_height > world_width {
+                    cols = (size as f64 / world_height * world_width).ceil() as usize;
                 }
             }
             let mut vec = Vec::with_capacity(rows * cols);
@@ -73,9 +73,9 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
 
         // Determine the root bounds to use
         let root_bounds = if !FIT {
-            let len = root_width.max(root_height);
-            root_width = len;
-            root_height = len;
+            let len = world_width.max(world_height);
+            let root_width = len;
+            let root_height = len;
 
             let (min_x, min_y) = world_bounds.get_min();
             let center_x = min_x + len * 0.5;
@@ -227,11 +227,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     ///
     /// [`GridLooseQuadTree::search_up`]: crate::grid_loose_quadtree::GridLooseQuadTree::search_up
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
-        if !self.world_bounds.contains_point(bounds.get_center()) {
-            self.get_root().search_items(bounds, &mut callback);
-            return;
-        }
-
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;

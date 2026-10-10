@@ -41,38 +41,10 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
             "`MAX_LEVEL` is too large and will cause overflow."
         );
 
-        let mut root_width = world_bounds.get_width();
-        let mut root_height = world_bounds.get_height();
-
-        let (offset_x, offset_y) = world_bounds.get_min();
-
-        // Initialize layers
-        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
-        let mut size = 0;
-        for n in 0..=MAX_LEVEL {
-            let (mut rows, mut cols) = (size, size);
-            if !FIT {
-                if root_width > root_height {
-                    rows = (size as f64 * root_height / root_width).ceil() as usize;
-                } else if root_height > root_width {
-                    cols = (size as f64 / root_height * root_width).ceil() as usize;
-                }
-            }
-            let mut vec = Vec::with_capacity(rows * cols);
-            let w = root_width / cols as f64;
-            let h = root_height / rows as f64;
-            for y in 0..rows {
-                for x in 0..cols {
-                    let cx = offset_x + (x as f64 + 0.5) * w;
-                    let cy = offset_y + (y as f64 + 0.5) * h;
-                    let looseness = 2.0;
-                    let rect = Rectangle::center_rect(cx, cy, w, h).scale(looseness);
-                    vec.push(GridLooseQuadTreeNode::new(rect));
-                }
-            }
-            layers.push(Grid::from_vec(vec, cols));
-            size = 1 << n;
-        }
+        let world_width = world_bounds.get_width();
+        let world_height = world_bounds.get_height();
+        let mut root_width = world_width;
+        let mut root_height = world_height;
 
         // Determine the root bounds to use
         let root_bounds = if !FIT {
@@ -87,6 +59,37 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
         } else {
             world_bounds.clone()
         };
+
+        let (offset_x, offset_y) = world_bounds.get_min();
+
+        // Initialize layers
+        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
+        let mut size = 0;
+        for n in 0..=MAX_LEVEL {
+            let (mut rows, mut cols) = (size, size);
+            if !FIT {
+                if world_width > world_height {
+                    rows = (size as f64 * world_height / world_width).ceil() as usize;
+                } else if world_height > world_width {
+                    cols = (size as f64 / world_height * world_width).ceil() as usize;
+                }
+            }
+            let mut vec = Vec::with_capacity(rows * cols);
+            let edge_max_node_num = rows.max(cols) as f64;
+            let w = root_width / edge_max_node_num;
+            let h = root_height / edge_max_node_num;
+            for y in 0..rows {
+                for x in 0..cols {
+                    let cx = offset_x + (x as f64 + 0.5) * w;
+                    let cy = offset_y + (y as f64 + 0.5) * h;
+                    let looseness = 2.0;
+                    let rect = Rectangle::center_rect(cx, cy, w, h).scale(looseness);
+                    vec.push(GridLooseQuadTreeNode::new(rect));
+                }
+            }
+            layers.push(Grid::from_vec(vec, cols));
+            size = 1 << n;
+        }
 
         GridLooseQuadTree {
             root_bounds,
@@ -238,11 +241,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     ///
     /// [`search_bidirectional`]: GridLooseQuadTree::search_bidirectional
     pub fn search_up(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
-        if !self.world_bounds.contains_point(bounds.get_center()) {
-            self.get_root().search_items(bounds, &mut callback);
-            return;
-        }
-
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;
@@ -338,11 +336,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     /// so we only need to check 3x3 areas centered on this path. This skips a lot
     /// of conditional judgments. For the remainder, use the traditional method.
     pub fn search_bidirectional(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
-        if !self.world_bounds.contains_point(bounds.get_center()) {
-            self.get_root().search_items(bounds, &mut callback);
-            return;
-        }
-
         let width = bounds.get_width();
         let height = bounds.get_height();
         let root_bounds = &self.root_bounds;

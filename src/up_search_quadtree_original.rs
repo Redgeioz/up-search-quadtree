@@ -261,6 +261,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
         if !self.world_bounds.intersects(bounds) {
             self.get_root().search_items(bounds, &mut callback);
+            return;
         }
 
         let root_bounds = &self.root_bounds;
@@ -311,7 +312,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
                     for x in min_coord_x..=max_coord_x {
                         let node = unsafe { grid.get_unchecked(y, x) };
 
-                        if y > min_coord_y && y < max_coord_y && x > min_coord_x && x > max_coord_x
+                        if y > min_coord_y && y < max_coord_y && x > min_coord_x && x < max_coord_x
                         {
                             // This node is fully contained, so the intersection checks can be skipped
                             node.iter_items(&mut callback);

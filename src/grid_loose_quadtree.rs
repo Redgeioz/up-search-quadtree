@@ -443,7 +443,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
     }
 
     fn search_up_3x3(&self, position: Coord, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
-        let (mut level, mut x, mut y) = position;
+        let (level, mut x, mut y) = position;
 
         self.layers[2..=level].iter().rev().for_each(|grid| unsafe {
             let grid_width = grid.cols();
@@ -504,7 +504,6 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> GridLooseQuadTree<T, MAX_LEVEL> {
 
             x >>= 1;
             y >>= 1;
-            level -= 1;
         });
 
         self.get_root().search_items(bounds, callback);

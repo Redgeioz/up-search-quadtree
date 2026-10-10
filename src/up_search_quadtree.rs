@@ -313,18 +313,20 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let root_width = root_bounds.get_width();
         let root_height = root_bounds.get_height();
 
-        let mut node_width = root_width / edge_max_node_num;
-        let mut node_height = root_height / edge_max_node_num;
+        let node_width = root_width / edge_max_node_num;
+        let node_height = root_height / edge_max_node_num;
 
         let mut x = (((bx - offset_x) / node_width) as usize).min(grid_width - 1);
         let mut y = (((by - offset_y) / node_height) as usize).min(grid_height - 1);
 
+        let mut center_x = offset_x + node_width * (x as f64 + 0.5);
+        let mut center_y = offset_y + node_height * (y as f64 + 0.5);
+        let mut half_width = node_width * 0.5;
+        let mut half_height = node_height * 0.5;
+
         self.layers[2..=level].iter().rev().for_each(|grid| unsafe {
             let grid_width = grid.cols();
             let grid_height = grid.rows();
-
-            let center_x = offset_x + node_width * (x as f64 + 0.5);
-            let center_y = offset_y + node_height * (y as f64 + 0.5);
 
             if bounds.min_y < center_y && y != 0 {
                 if bounds.min_x < center_x && x != 0 {
@@ -377,10 +379,16 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                 }
             }
 
-            node_width *= 2.0;
-            node_height *= 2.0;
-            x /= 2;
-            y /= 2;
+            center_x += if x & 1 == 0 { half_width } else { -half_width };
+            center_y += if y & 1 == 0 {
+                half_height
+            } else {
+                -half_height
+            };
+            half_width *= 2.0;
+            half_height *= 2.0;
+            x >>= 1;
+            y >>= 1;
         });
 
         self.get_root().search_items(bounds, callback);

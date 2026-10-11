@@ -9,6 +9,120 @@ type Location = (usize, usize, usize, usize);
 type Coord = (usize, usize, usize);
 type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 
+/// Immutable layer geometry and the current number of stored objects.
+#[derive(Default)]
+struct LayerGeometry {
+    node_width: f64,
+    node_height: f64,
+    // Inclusive size limits for this level and the next finer level.
+    max_object_width: f64,
+    max_object_height: f64,
+    next_level_max_width: f64,
+    next_level_max_height: f64,
+    // Half-open cell intervals, measured relative to the root's origin.
+    // Empty arrays disable the update shortcut for root or degenerate layers.
+    cell_x_edges: Vec<f64>,
+    cell_y_edges: Vec<f64>,
+    objects: usize,
+}
+
+impl LayerGeometry {
+    fn new(root_bounds: &Rectangle, level: usize, cols: usize, rows: usize) -> Self {
+        let root_width = root_bounds.get_width();
+        let root_height = root_bounds.get_height();
+        let cells_per_axis = cols.max(rows) as f64;
+        let mut geometry = Self {
+            // Preserve division here and in position/search: multiplying by a
+            // reciprocal can round across a cell boundary.
+            node_width: root_width / cells_per_axis,
+            node_height: root_height / cells_per_axis,
+            ..Self::default()
+        };
+
+        // A root item may have come from outside the world. Root updates and
+        // layers without usable dimensions keep using full positioning.
+        if level == 1
+            || !root_width.is_finite()
+            || !root_height.is_finite()
+            || root_width <= 0.0
+            || root_height <= 0.0
+            || geometry.node_width <= 0.0
+            || geometry.node_height <= 0.0
+        {
+            return geometry;
+        }
+
+        let level_multiple = 1 << (level - 1);
+        let next_level_multiple = 1 << level;
+        geometry.max_object_width = Self::max_size_for_multiple(root_width, level_multiple);
+        geometry.max_object_height = Self::max_size_for_multiple(root_height, level_multiple);
+        geometry.next_level_max_width =
+            Self::max_size_for_multiple(root_width, next_level_multiple);
+        geometry.next_level_max_height =
+            Self::max_size_for_multiple(root_height, next_level_multiple);
+        geometry.cell_x_edges = Self::cell_edges(geometry.node_width, cols);
+        geometry.cell_y_edges = Self::cell_edges(geometry.node_height, rows);
+        geometry
+    }
+
+    fn has_update_cache(&self) -> bool {
+        !self.cell_x_edges.is_empty()
+    }
+
+    fn matches_layer(&self, width: f64, height: f64, is_finest_layer: bool) -> bool {
+        // Both dimensions must fit this layer. Unless it is the finest layer,
+        // at least one dimension must be too large for the next finer layer.
+        width > 0.0
+            && height > 0.0
+            && width <= self.max_object_width
+            && height <= self.max_object_height
+            && (is_finest_layer
+                || width > self.next_level_max_width
+                || height > self.next_level_max_height)
+    }
+
+    fn matches_cell(&self, relative_center: (f64, f64), cell: (usize, usize)) -> bool {
+        let (center_x, center_y) = relative_center;
+        let (x, y) = cell;
+        center_x >= self.cell_x_edges[x]
+            && center_x < self.cell_x_edges[x + 1]
+            && center_y >= self.cell_y_edges[y]
+            && center_y < self.cell_y_edges[y + 1]
+    }
+
+    /// Largest size satisfying `(root_size / size) as usize >= multiple`.
+    /// Adjust adjacent floats so the cached limit agrees with position's division.
+    fn max_size_for_multiple(root_size: f64, multiple: usize) -> f64 {
+        let mut size = root_size / multiple as f64;
+        while size > 0.0 && ((root_size / size) as usize) < multiple {
+            size = size.next_down();
+        }
+        while (root_size / size.next_up()) as usize >= multiple {
+            size = size.next_up();
+        }
+        size
+    }
+
+    /// Smallest relative coordinate mapped to each cell by division and casting.
+    /// Multiplication alone can differ at adjacent floating-point values.
+    fn cell_edges(cell_size: f64, cell_count: usize) -> Vec<f64> {
+        let mut edges = Vec::with_capacity(cell_count + 1);
+        edges.push(f64::NEG_INFINITY); // Negative casts saturate to cell zero.
+        for index in 1..cell_count {
+            let mut edge = cell_size * index as f64;
+            while ((edge / cell_size) as usize) < index {
+                edge = edge.next_up();
+            }
+            while (edge.next_down() / cell_size) as usize >= index {
+                edge = edge.next_down();
+            }
+            edges.push(edge);
+        }
+        edges.push(f64::INFINITY); // The last cell clamps all larger coordinates.
+        edges
+    }
+}
+
 /// Optimized [`GridLooseQuadTree`] retaining only the up-search function.
 ///
 /// The main change is to store only the items on each node to reduce the size of each node.
@@ -18,6 +132,7 @@ type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 /// [`GridLooseQuadTree`]: crate::grid_loose_quadtree::GridLooseQuadTree
 pub struct UpSearchQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
     layers: Layers<T>,
+    geometry: Vec<LayerGeometry>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     items: HashMap<T, Location>,
@@ -85,8 +200,21 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             world_bounds.clone()
         };
 
+        // Geometry is fixed for the lifetime of the tree; only object counts change.
+        let mut geometry = Vec::with_capacity(layers.len());
+        geometry.push(LayerGeometry::default()); // Unused level zero.
+        for (level, grid) in layers.iter().enumerate().skip(1) {
+            geometry.push(LayerGeometry::new(
+                &root_bounds,
+                level,
+                grid.cols(),
+                grid.rows(),
+            ));
+        }
+
         UpSearchQuadTree {
             layers,
+            geometry,
             root_bounds,
             world_bounds,
             items: HashMap::new(),
@@ -129,9 +257,11 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
-        let edge_max_node_num = grid_width.max(grid_height) as f64;
-        let node_width = root_width / edge_max_node_num;
-        let node_height = root_height / edge_max_node_num;
+        let LayerGeometry {
+            node_width,
+            node_height,
+            ..
+        } = self.geometry[level];
 
         let coord_x = (((x - offset_x) / node_width) as usize).min(grid_width - 1);
         let coord_y = (((y - offset_y) / node_height) as usize).min(grid_height - 1);
@@ -160,6 +290,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let location = (coord.0, coord.1, coord.2, node.items.len());
         node.add(bounds, item);
         self.items.insert(item, location);
+        self.geometry[level].objects += 1;
         coord
     }
 
@@ -184,13 +315,33 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         }
 
         self.items.remove(&item);
+        self.geometry[level].objects -= 1;
     }
 
     /// Update the bounds of an item and, if necessary, its position in the quadtree.
     pub fn update(&mut self, bounds: Rectangle, item: T) {
+        let &(level, x, y, i) = self.items.get(&item).expect("Update item not found.");
+        let geometry = &self.geometry[level];
+        if geometry.has_update_cache() {
+            let center = bounds.get_center();
+            let relative_center = (
+                center.0 - self.root_bounds.min_x,
+                center.1 - self.root_bounds.min_y,
+            );
+            // Exact intervals mirror position's division, truncation and clamp.
+            // Resizing within the same level can also take this path.
+            if geometry.matches_layer(
+                bounds.get_width(),
+                bounds.get_height(),
+                level == MAX_LEVEL as usize,
+            ) && geometry.matches_cell(relative_center, (x, y))
+                && self.world_bounds.contains_point(center)
+            {
+                self.layers[level][y][x].update(bounds, i);
+                return;
+            }
+        }
         let curt_coord = self.position(&bounds);
-        let prev_location = self.items.get_mut(&item).expect("Update item not found.");
-        let (level, x, y, i) = *prev_location;
         let prev_coord = (level, x, y);
 
         if curt_coord == prev_coord {
@@ -201,6 +352,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let (nl, nx, ny) = curt_coord;
         let (ol, ox, oy) = prev_coord;
 
+        let prev_location = self.items.get_mut(&item).expect("Update item not found.");
         let new_node = &mut self.layers[nl][ny][nx];
 
         prev_location.0 = nl;
@@ -209,6 +361,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         prev_location.3 = new_node.items.len();
 
         new_node.add(bounds, item);
+        self.geometry[nl].objects += 1;
+        self.geometry[ol].objects -= 1;
 
         let old_node = &mut self.layers[ol][oy][ox];
         let last_idx = old_node.items.len() - 1;
@@ -255,41 +409,50 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let calc_max = |n: f64| (n - 0.5).ceil() as usize;
 
             // Note: Searching directly from the bottom to the top using this method will be slower
-            layers[level + 1..=max_level].iter().rev().for_each(|grid| {
-                let grid_width = grid.cols();
-                let grid_height = grid.rows();
+            layers[level + 1..=max_level]
+                .iter()
+                .zip(&self.geometry[level + 1..=max_level])
+                .rev()
+                .for_each(|(grid, geometry)| {
+                    if geometry.objects == 0 {
+                        return;
+                    }
+                    let grid_width = grid.cols();
+                    let grid_height = grid.rows();
 
-                let edge_max_node_num = grid_width.max(grid_height) as f64;
-                let node_width = root_width / edge_max_node_num;
-                let node_height = root_height / edge_max_node_num;
+                    let LayerGeometry {
+                        node_width,
+                        node_height,
+                        ..
+                    } = *geometry;
 
-                let min_coord_x = calc_min(min_x / node_width);
-                let min_coord_y = calc_min(min_y / node_height);
+                    let min_coord_x = calc_min(min_x / node_width);
+                    let min_coord_y = calc_min(min_y / node_height);
 
-                let max_coord_x = (calc_max(max_x / node_width)).min(grid_width - 1);
-                let max_coord_y = (calc_max(max_y / node_height)).min(grid_height - 1);
+                    let max_coord_x = (calc_max(max_x / node_width)).min(grid_width - 1);
+                    let max_coord_y = (calc_max(max_y / node_height)).min(grid_height - 1);
 
-                // Scan the region obtained
-                for y in min_coord_y..=max_coord_y {
-                    for x in min_coord_x..=max_coord_x {
-                        let node = unsafe { grid.get_unchecked(y, x) };
-                        if node.items.is_empty() {
-                            continue;
-                        }
+                    // Scan the region obtained
+                    for y in min_coord_y..=max_coord_y {
+                        for x in min_coord_x..=max_coord_x {
+                            let node = unsafe { grid.get_unchecked(y, x) };
+                            if node.items.is_empty() {
+                                continue;
+                            }
 
-                        if y > min_coord_y + 1
-                            && y < max_coord_y - 1
-                            && x > min_coord_x + 1
-                            && x < max_coord_x - 1
-                        {
-                            // This node is fully contained, so the intersection checks can be skipped
-                            node.iter_items(&mut callback);
-                        } else {
-                            node.search_items(bounds, &mut callback);
+                            if y > min_coord_y + 1
+                                && y < max_coord_y - 1
+                                && x > min_coord_x + 1
+                                && x < max_coord_x - 1
+                            {
+                                // This node is fully contained, so the intersection checks can be skipped
+                                node.iter_items(&mut callback);
+                            } else {
+                                node.search_items(bounds, &mut callback);
+                            }
                         }
                     }
-                }
-            });
+                });
         }
 
         if level == 1 {
@@ -306,15 +469,13 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let grid_width = grid.cols();
         let grid_height = grid.rows();
 
-        let edge_max_node_num = grid_width.max(grid_height) as f64;
-
         let root_bounds = &self.root_bounds;
         let (offset_x, offset_y) = root_bounds.get_min();
-        let root_width = root_bounds.get_width();
-        let root_height = root_bounds.get_height();
-
-        let node_width = root_width / edge_max_node_num;
-        let node_height = root_height / edge_max_node_num;
+        let LayerGeometry {
+            node_width,
+            node_height,
+            ..
+        } = self.geometry[level];
 
         let mut x = (((bx - offset_x) / node_width) as usize).min(grid_width - 1);
         let mut y = (((by - offset_y) / node_height) as usize).min(grid_height - 1);
@@ -324,72 +485,78 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let mut half_width = node_width * 0.5;
         let mut half_height = node_height * 0.5;
 
-        self.layers[2..=level].iter().rev().for_each(|grid| unsafe {
-            let grid_width = grid.cols();
-            let grid_height = grid.rows();
+        self.layers[2..=level]
+            .iter()
+            .enumerate()
+            .rev()
+            .for_each(|(index, grid)| unsafe {
+                if self.geometry[index + 2].objects != 0 {
+                    let grid_width = grid.cols();
+                    let grid_height = grid.rows();
 
-            if bounds.min_y < center_y && y != 0 {
-                if bounds.min_x < center_x && x != 0 {
-                    let node = grid.get_unchecked(y - 1, x - 1);
-                    node.search_items(bounds, callback);
+                    if bounds.min_y < center_y && y != 0 {
+                        if bounds.min_x < center_x && x != 0 {
+                            let node = grid.get_unchecked(y - 1, x - 1);
+                            node.search_items(bounds, callback);
+                        }
+
+                        {
+                            let node = grid.get_unchecked(y - 1, x);
+                            node.search_items(bounds, callback);
+                        }
+
+                        if bounds.max_x > center_x && x + 1 != grid_width {
+                            let node = grid.get_unchecked(y - 1, x + 1);
+                            node.search_items(bounds, callback);
+                        }
+                    }
+
+                    {
+                        if bounds.min_x < center_x && x != 0 {
+                            let node = grid.get_unchecked(y, x - 1);
+                            node.search_items(bounds, callback);
+                        }
+
+                        {
+                            let node = grid.get_unchecked(y, x);
+                            node.search_items(bounds, callback);
+                        }
+
+                        if bounds.max_x > center_x && x + 1 != grid_width {
+                            let node = grid.get_unchecked(y, x + 1);
+                            node.search_items(bounds, callback);
+                        }
+                    }
+
+                    if bounds.max_y > center_y && y + 1 != grid_height {
+                        if bounds.min_x < center_x && x != 0 {
+                            let node = grid.get_unchecked(y + 1, x - 1);
+                            node.search_items(bounds, callback);
+                        }
+
+                        {
+                            let node = grid.get_unchecked(y + 1, x);
+                            node.search_items(bounds, callback);
+                        }
+
+                        if bounds.max_x > center_x && x + 1 != grid_width {
+                            let node = grid.get_unchecked(y + 1, x + 1);
+                            node.search_items(bounds, callback);
+                        }
+                    }
                 }
-
-                {
-                    let node = grid.get_unchecked(y - 1, x);
-                    node.search_items(bounds, callback);
-                }
-
-                if bounds.max_x > center_x && x + 1 != grid_width {
-                    let node = grid.get_unchecked(y - 1, x + 1);
-                    node.search_items(bounds, callback);
-                }
-            }
-
-            {
-                if bounds.min_x < center_x && x != 0 {
-                    let node = grid.get_unchecked(y, x - 1);
-                    node.search_items(bounds, callback);
-                }
-
-                {
-                    let node = grid.get_unchecked(y, x);
-                    node.search_items(bounds, callback);
-                }
-
-                if bounds.max_x > center_x && x + 1 != grid_width {
-                    let node = grid.get_unchecked(y, x + 1);
-                    node.search_items(bounds, callback);
-                }
-            }
-
-            if bounds.max_y > center_y && y + 1 != grid_height {
-                if bounds.min_x < center_x && x != 0 {
-                    let node = grid.get_unchecked(y + 1, x - 1);
-                    node.search_items(bounds, callback);
-                }
-
-                {
-                    let node = grid.get_unchecked(y + 1, x);
-                    node.search_items(bounds, callback);
-                }
-
-                if bounds.max_x > center_x && x + 1 != grid_width {
-                    let node = grid.get_unchecked(y + 1, x + 1);
-                    node.search_items(bounds, callback);
-                }
-            }
-
-            center_x += if x & 1 == 0 { half_width } else { -half_width };
-            center_y += if y & 1 == 0 {
-                half_height
-            } else {
-                -half_height
-            };
-            half_width *= 2.0;
-            half_height *= 2.0;
-            x >>= 1;
-            y >>= 1;
-        });
+                // Advance the ancestor path even when this layer has no objects.
+                center_x += if x & 1 == 0 { half_width } else { -half_width };
+                center_y += if y & 1 == 0 {
+                    half_height
+                } else {
+                    -half_height
+                };
+                half_width *= 2.0;
+                half_height *= 2.0;
+                x >>= 1;
+                y >>= 1;
+            });
 
         self.get_root().search_items(bounds, callback);
     }

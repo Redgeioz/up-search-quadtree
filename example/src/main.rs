@@ -24,6 +24,7 @@ type QTree = UpSearchQuadTree<usize, MAX_LEVEL>;
 struct Data {
     pub quadtree: QTree,
     pub balls: Vec<Ball>,
+    pub handles: Vec<ItemHandle>,
     pub world_bounds: Rectangle,
     pub last_print: f32,
 }
@@ -44,6 +45,7 @@ fn setup(mut commands: Commands) {
     let mut quadtree = QTree::new(bounds.clone());
 
     let mut balls = Vec::with_capacity(BALL_COUNT);
+    let mut handles = Vec::with_capacity(BALL_COUNT);
     for _ in 0..BALL_COUNT {
         let (x, y) = bounds.get_random_point(&mut rng);
         let mut r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
@@ -67,7 +69,7 @@ fn setup(mut commands: Commands) {
         let id = balls.len();
         let bounds = ball.get_bounds();
         balls.push(ball);
-        quadtree.insert(bounds.clone(), id);
+        handles.push(quadtree.insert(bounds.clone(), id));
     }
 
     let mut camera = Camera2dBundle::default();
@@ -77,6 +79,7 @@ fn setup(mut commands: Commands) {
     commands.insert_resource(Data {
         quadtree,
         balls,
+        handles,
         world_bounds: bounds,
         last_print: 0.0,
     });
@@ -86,6 +89,7 @@ fn update(mut res: ResMut<Data>, mut gizmos: Gizmos) {
     let Data {
         quadtree,
         balls,
+        handles,
         world_bounds,
         last_print: _,
     } = &mut *res;
@@ -114,7 +118,7 @@ fn update(mut res: ResMut<Data>, mut gizmos: Gizmos) {
 
         let ball = balls.get_mut(id).unwrap();
 
-        quadtree.update(ball.get_bounds(), id);
+        quadtree.update(ball.get_bounds(), handles[id]);
     }
 
     {

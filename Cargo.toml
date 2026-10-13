@@ -18,5 +18,9 @@ criterion = "0.5"
 name = "search"
 harness = false
 
+[[bench]]
+name = "update"
+harness = false
+
 [workspace]
 members = ["example"]

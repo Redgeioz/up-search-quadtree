@@ -1,6 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::*;
-use std::hash::Hash;
 use std::hint::black_box;
 
 use lib::ball::*;
@@ -22,11 +21,14 @@ const MAX_RADIUS: f64 = 50.0;
 
 const BOUNDS: Rectangle = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
+/// Cell size of the uniform grids: the finest node size of the quadtrees.
+const GRID_CELL_SIZE: f64 = BOUND_WIDTH / (1u32 << (MAX_LEVEL - 1)) as f64;
+
 trait QTree<T> {
     fn insert_item(&mut self, bounds: Rectangle, item: T);
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     for QuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
@@ -34,7 +36,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
@@ -42,19 +44,31 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for GridLooseQuadTree<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for GridLooseQuadTree<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTree<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTree<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+}
+
+impl<T: Copy> QTree<T> for UniformGrid<T> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+}
+
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for MultiLayerGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
@@ -163,12 +177,44 @@ fn quadtree_uso(c: &mut Criterion) {
     });
 }
 
+fn grid_uniform(c: &mut Criterion) {
+    let mut grid = UniformGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE);
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+
+    c.bench_function("UniformGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn grid_multi_layer(c: &mut Criterion) {
+    let mut grid = MultiLayerGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+
+    c.bench_function("MultiLayerGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
 criterion_group!(
     bench,
     quadtree,
     quadtree_uso,
     quadtree_loose,
     quadtree_gl,
-    quadtree_us
+    quadtree_us,
+    grid_uniform,
+    grid_multi_layer,
 );
 criterion_main!(bench);

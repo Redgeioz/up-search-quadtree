@@ -1,205 +1,11 @@
+use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
+use crate::layer_geometry::LayerGeometry;
 use crate::rect::Rectangle;
 use grid::*;
 
 /// (level, x, y)
 type Coord = (usize, usize, usize);
 type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
-
-/// Identifies an inserted item for [`UpSearchQuadTree::update`] and
-/// [`UpSearchQuadTree::remove`].
-///
-/// Slots are reused after removal; the generation tells a handle whose item
-/// has been removed apart from the handle of the item that took its slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ItemHandle {
-    index: u32,
-    generation: u32,
-}
-
-/// Where the item of a handle is stored, indexed by `ItemHandle::index`.
-///
-/// A freed slot already carries the generation that the next `insert` will
-/// hand out, so every handle issued before the removal stops matching.
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    generation: u32,
-    level: u32,
-    x: u32,
-    y: u32,
-    index: u32,
-}
-
-impl Slot {
-    fn coord(&self) -> Coord {
-        (self.level as usize, self.x as usize, self.y as usize)
-    }
-}
-
-/// One stored item. `bounds` comes first so that intersection tests read the
-/// front of the entry; `handle` is only needed when entries move.
-#[repr(C)]
-struct Entry<T> {
-    bounds: Rectangle,
-    item: T,
-    handle: ItemHandle,
-}
-
-/// Per-level constants derived from the root bounds, plus the number of
-/// objects currently stored on that level.
-///
-/// Everything except `object_count` is fixed for the lifetime of the tree.
-/// The size limits and cell edges are computed to agree bit-for-bit with the
-/// arithmetic in [`UpSearchQuadTree::position`], which lets `update` confirm
-/// that an item stays in its node without repeating that computation.
-#[derive(Default)]
-struct LayerGeometry {
-    node_width: f64,
-    node_height: f64,
-    /// Largest object (inclusive) that `position` assigns to this level.
-    max_object_width: f64,
-    max_object_height: f64,
-    /// Largest object (inclusive) that `position` assigns to the next finer level.
-    next_level_max_object_width: f64,
-    next_level_max_object_height: f64,
-    /// Lower edge of every cell along each axis, relative to the root origin.
-    /// Cell `i` covers the half-open interval `edges[i]..edges[i + 1]`.
-    /// Left empty on the root and on degenerate layers to disable the update shortcut.
-    cell_x_edges: Vec<f64>,
-    cell_y_edges: Vec<f64>,
-    object_count: usize,
-}
-
-impl LayerGeometry {
-    /// Geometry of `level`, whose grid has `cols` by `rows` cells.
-    fn new(root_bounds: &Rectangle, level: usize, cols: usize, rows: usize) -> Self {
-        let root_width = root_bounds.get_width();
-        let root_height = root_bounds.get_height();
-        // Preserve division here and in position/search: multiplying by a
-        // reciprocal can round across a cell boundary.
-        let cells_per_axis = cols.max(rows) as f64;
-        let node_width = root_width / cells_per_axis;
-        let node_height = root_height / cells_per_axis;
-
-        // A root item may have come from outside the world, and degenerate
-        // sizes have no exact limits. Both keep using full positioning.
-        let is_root = level == 1;
-        let sizes_are_usable = [root_width, root_height, node_width, node_height]
-            .into_iter()
-            .all(|size| size.is_finite() && size > 0.0);
-        if is_root || !sizes_are_usable {
-            return Self {
-                node_width,
-                node_height,
-                ..Self::default()
-            };
-        }
-
-        // `position` assigns an object to this level when it fits across the
-        // root at least `2^(level - 1)` times but fewer than `2^level` times.
-        let min_multiple = 1 << (level - 1);
-        let next_level_min_multiple = 1 << level;
-        Self {
-            node_width,
-            node_height,
-            max_object_width: Self::max_size_for_multiple(root_width, min_multiple),
-            max_object_height: Self::max_size_for_multiple(root_height, min_multiple),
-            next_level_max_object_width: Self::max_size_for_multiple(
-                root_width,
-                next_level_min_multiple,
-            ),
-            next_level_max_object_height: Self::max_size_for_multiple(
-                root_height,
-                next_level_min_multiple,
-            ),
-            cell_x_edges: Self::cell_edges(node_width, cols),
-            cell_y_edges: Self::cell_edges(node_height, rows),
-            object_count: 0,
-        }
-    }
-
-    // The predicates below are not generic but run inside the generic tree
-    // methods, which other crates instantiate. `#[inline]` keeps them
-    // inlinable there; without it `update` measured a few percent slower.
-
-    /// Whether `matches_layer` and `matches_cell` are usable on this level.
-    #[inline]
-    fn has_update_shortcut(&self) -> bool {
-        !self.cell_x_edges.is_empty()
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.object_count == 0
-    }
-
-    /// Whether `position` assigns an object of this size to this level.
-    #[inline]
-    fn matches_layer(&self, width: f64, height: f64, is_finest_layer: bool) -> bool {
-        // Degenerate sizes fall through to full positioning.
-        if !(width > 0.0 && height > 0.0) {
-            return false;
-        }
-        let fits_this_level = width <= self.max_object_width && height <= self.max_object_height;
-        if !fits_this_level {
-            return false;
-        }
-        // The finest level keeps everything that would otherwise go further
-        // down. Elsewhere the object must be too large for the next finer level.
-        is_finest_layer
-            || width > self.next_level_max_object_width
-            || height > self.next_level_max_object_height
-    }
-
-    /// Whether `position` maps a center at this offset from the root origin to `cell`.
-    #[inline]
-    fn matches_cell(&self, relative_center: (f64, f64), cell: (usize, usize)) -> bool {
-        let (center_x, center_y) = relative_center;
-        let (x, y) = cell;
-        (self.cell_x_edges[x]..self.cell_x_edges[x + 1]).contains(&center_x)
-            && (self.cell_y_edges[y]..self.cell_y_edges[y + 1]).contains(&center_y)
-    }
-
-    /// Largest `size` for which `(root_size / size) as usize >= multiple`, i.e.
-    /// the largest object that `position` still counts as fitting across the
-    /// root `multiple` times.
-    ///
-    /// The exact quotient may land on either side of the cast boundary, so walk
-    /// through adjacent floats until the boundary is found.
-    fn max_size_for_multiple(root_size: f64, multiple: usize) -> f64 {
-        let fits_multiple_times = |size: f64| (root_size / size) as usize >= multiple;
-        let mut size = root_size / multiple as f64;
-        while size > 0.0 && !fits_multiple_times(size) {
-            size = size.next_down();
-        }
-        while fits_multiple_times(size.next_up()) {
-            size = size.next_up();
-        }
-        size
-    }
-
-    /// Lower edge of every cell as seen by `position`: `edges[i]` is the
-    /// smallest relative coordinate `c` with `(c / cell_size) as usize == i`.
-    ///
-    /// `cell_size * i` may land on either side of the cast boundary, so walk
-    /// through adjacent floats until the boundary is found.
-    fn cell_edges(cell_size: f64, cell_count: usize) -> Vec<f64> {
-        let cell_of = |coordinate: f64| (coordinate / cell_size) as usize;
-        let mut edges = Vec::with_capacity(cell_count + 1);
-        edges.push(f64::NEG_INFINITY); // Negative casts saturate to cell zero.
-        for index in 1..cell_count {
-            let mut edge = cell_size * index as f64;
-            while cell_of(edge) < index {
-                edge = edge.next_up();
-            }
-            while cell_of(edge.next_down()) >= index {
-                edge = edge.next_down();
-            }
-            edges.push(edge);
-        }
-        edges.push(f64::INFINITY); // The last cell clamps all larger coordinates.
-        edges
-    }
-}
 
 /// Optimized [`GridLooseQuadTree`] retaining only the up-search function.
 ///
@@ -214,10 +20,8 @@ pub struct UpSearchQuadTree<T: Copy, const MAX_LEVEL: u8> {
     geometry: Vec<LayerGeometry>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
-    /// Indexed by `ItemHandle::index`.
-    slots: Vec<Slot>,
-    /// Slots released by `remove`, reused by the next `insert`.
-    free_slots: Vec<u32>,
+    /// Where the entry of each live handle is stored.
+    slots: Slots<GridLocation>,
 }
 
 impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
@@ -298,8 +102,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             geometry,
             root_bounds,
             world_bounds,
-            slots: Vec::new(),
-            free_slots: Vec::new(),
+            slots: Slots::new(),
         }
     }
 
@@ -360,17 +163,11 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     /// The time complexity is O(1) since the insertion position is obtained directly
     /// by computation, instead of by judgment at each node.
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
-        let (level, x, y) = self.position(&bounds);
-        let handle = self.allocate_handle();
-
+        let coord @ (level, x, y) = self.position(&bounds);
         let node = &mut self.layers[level][y][x];
-        self.slots[handle.index as usize] = Slot {
-            generation: handle.generation,
-            level: level as u32,
-            x: x as u32,
-            y: y as u32,
-            index: node.items.len() as u32,
-        };
+        let handle = self
+            .slots
+            .allocate(GridLocation::new(coord, node.items.len()));
         node.items.push(Entry {
             bounds,
             item,
@@ -384,14 +181,11 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     ///
     /// Panics if the handle has already been removed.
     pub fn remove(&mut self, handle: ItemHandle) {
-        let slot = self.slot(handle);
-        let (level, x, y) = slot.coord();
-
-        let entry = self.take_entry(level, x, y, slot.index as usize);
+        let location = self.slots.get(handle);
+        let (level, x, y) = location.coord();
+        let entry = self.take_entry(level, x, y, location.index as usize);
         debug_assert_eq!(entry.handle, handle);
-
-        self.slots[handle.index as usize].generation = handle.generation.wrapping_add(1);
-        self.free_slots.push(handle.index);
+        self.slots.free(handle);
         self.geometry[level].object_count -= 1;
     }
 
@@ -399,9 +193,9 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        let slot = self.slot(handle);
-        let prev_coord @ (level, x, y) = slot.coord();
-        let i = slot.index as usize;
+        let location = self.slots.get(handle);
+        let prev_coord @ (level, x, y) = location.coord();
+        let i = location.index as usize;
 
         if self.stays_in_node(&bounds, prev_coord) {
             self.layers[level][y][x].items[i].bounds = bounds;
@@ -417,50 +211,22 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let (nl, nx, ny) = curt_coord;
         let entry = self.take_entry(level, x, y, i);
         let new_node = &mut self.layers[nl][ny][nx];
-        self.slots[handle.index as usize] = Slot {
-            generation: handle.generation,
-            level: nl as u32,
-            x: nx as u32,
-            y: ny as u32,
-            index: new_node.items.len() as u32,
-        };
+        *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
         new_node.items.push(Entry { bounds, ..entry });
         self.geometry[nl].object_count += 1;
         self.geometry[level].object_count -= 1;
     }
 
-    /// Slot of a live handle.
-    fn slot(&self, handle: ItemHandle) -> Slot {
-        let slot = self.slots[handle.index as usize];
-        assert!(
-            slot.generation == handle.generation,
-            "The handle has been removed."
-        );
-        slot
-    }
-
-    /// Reuse a freed slot if there is one, otherwise grow the slot table.
-    fn allocate_handle(&mut self) -> ItemHandle {
-        if let Some(index) = self.free_slots.pop() {
-            let generation = self.slots[index as usize].generation;
-            ItemHandle { index, generation }
-        } else {
-            let index = u32::try_from(self.slots.len()).expect("Too many items for u32 handles.");
-            self.slots.push(Slot::default());
-            ItemHandle {
-                index,
-                generation: 0,
-            }
-        }
-    }
-
     /// Take the entry at `index` out of a node. The entry that fills the gap
     /// has its slot updated, so handles stay valid without any lookup.
+    ///
+    /// Takes plain coordinates rather than a `GridLocation`: keeping the whole
+    /// location alive across `update` measured several percent slower.
     fn take_entry(&mut self, level: usize, x: usize, y: usize, index: usize) -> Entry<T> {
         let node = &mut self.layers[level][y][x];
         let entry = node.items.swap_remove(index);
         if let Some(moved) = node.items.get(index) {
-            self.slots[moved.handle.index as usize].index = index as u32;
+            self.slots.get_mut(moved.handle).index = index as u32;
         }
         entry
     }
@@ -725,21 +491,17 @@ mod tests {
         let world = &tree.world_bounds;
         let geometry = &tree.geometry[rng.gen_range(1..=MAX_LEVEL as usize)];
 
-        let size_limits = |max: f64, next_max: f64| -> Vec<f64> {
+        // The node size is the size limit of the level, half of it that of the
+        // next finer level.
+        let size_limits = |node_size: f64| -> Vec<f64> {
             if geometry.has_update_shortcut() {
-                vec![max, next_max]
+                vec![node_size, node_size * 0.5]
             } else {
                 Vec::new()
             }
         };
-        let width_limits = size_limits(
-            geometry.max_object_width,
-            geometry.next_level_max_object_width,
-        );
-        let height_limits = size_limits(
-            geometry.max_object_height,
-            geometry.next_level_max_object_height,
-        );
+        let width_limits = size_limits(geometry.node_width);
+        let height_limits = size_limits(geometry.node_height);
         let width = near_one_of(rng, &width_limits, 0.0..root.get_width() * 1.1);
         let height = near_one_of(rng, &height_limits, 0.0..root.get_height() * 1.1);
 
@@ -859,7 +621,7 @@ mod tests {
                 handles.push(tree.insert(bounds.clone(), item));
                 bounds_of.push(bounds);
             }
-            assert_eq!(tree.slots.len(), 500);
+            assert_eq!(tree.slots.slot_count(), 500);
             assert_consistent(&tree, &handles, &bounds_of);
         }
     }
@@ -873,18 +635,21 @@ mod tests {
         let stale = tree.insert(bounds.clone(), 0);
         tree.remove(stale);
         let reused = tree.insert(bounds.clone(), 1);
-        assert_eq!(reused.index, stale.index);
         assert_ne!(reused, stale);
         tree.update(bounds, stale);
     }
 
     fn assert_consistent(tree: &Tree, handles: &[ItemHandle], bounds_of: &[Rectangle]) {
-        assert_eq!(tree.slots.len() - tree.free_slots.len(), handles.len());
+        assert_eq!(tree.slots.len(), handles.len());
         for (item, (handle, bounds)) in handles.iter().zip(bounds_of).enumerate() {
-            let slot = tree.slot(*handle);
-            assert_eq!(slot.coord(), tree.position(bounds), "location of {item}");
-            let (level, x, y) = slot.coord();
-            let entry = &tree.layers[level][y][x].items[slot.index as usize];
+            let location = tree.slots.get(*handle);
+            assert_eq!(
+                location.coord(),
+                tree.position(bounds),
+                "location of {item}"
+            );
+            let (level, x, y) = location.coord();
+            let entry = &tree.layers[level][y][x].items[location.index as usize];
             assert_eq!(entry.item, item);
             assert_eq!(entry.handle, *handle);
             assert_eq!(entry.bounds, *bounds);

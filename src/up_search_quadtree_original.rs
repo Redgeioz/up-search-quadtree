@@ -1,8 +1,7 @@
+use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::rect::Rectangle;
 
 use grid::*;
-use std::collections::HashMap;
-use std::hash::Hash;
 
 /// # Examples
 /// ```ignore
@@ -18,20 +17,19 @@ fn find_common(a: usize, b: usize) -> (usize, usize) {
     (a >> shift_steps, shift_steps)
 }
 
-/// (level, x, y, i)
-type Location = (usize, usize, usize, usize);
 /// (level, x, y)
 type Coord = (usize, usize, usize);
 type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
 
-pub struct UpSearchQuadTreeOriginal<T: Copy + Eq + Hash, const MAX_LEVEL: u8> {
+pub struct UpSearchQuadTreeOriginal<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
-    items: HashMap<T, Location>,
+    /// Where the entry of each live handle is stored.
+    slots: Slots<GridLocation>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
     /// Create a new quadtree with the given bounds.
     ///
     /// Force using a square as the bounds of each node. This usually makes searches more efficient.
@@ -97,7 +95,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
             layers,
             root_bounds,
             world_bounds,
-            items: HashMap::new(),
+            slots: Slots::new(),
         }
     }
 
@@ -179,82 +177,69 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
         unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
-    fn get_node_mut(&mut self, level: usize, x: usize, y: usize) -> &mut UpSearchQuadTreeNode<T> {
-        &mut self.layers[level][y][x]
-    }
-
-    /// Insert an item into the quadtree.
+    /// Insert an item into the quadtree and return the handle that identifies
+    /// it for [`update`](Self::update) and [`remove`](Self::remove).
     ///
     /// The time complexity is O(1) since the insertion position is obtained directly
     /// by computation, instead of by judgment at each node.
-    pub fn insert(&mut self, bounds: Rectangle, item: T) -> Coord {
-        let coord = self.position(&bounds);
-
-        let (level, x, y) = coord;
-        let node = self.get_node_mut(level, x, y);
-
-        let location = (coord.0, coord.1, coord.2, node.items.len());
-        node.add(bounds, item);
-        self.items.insert(item, location);
-        coord
+    pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
+        let coord @ (level, x, y) = self.position(&bounds);
+        let node = &mut self.layers[level][y][x];
+        let handle = self
+            .slots
+            .allocate(GridLocation::new(coord, node.items.len()));
+        node.items.push(Entry {
+            bounds,
+            item,
+            handle,
+        });
+        handle
     }
 
     /// Remove an item from the quadtree.
-    pub fn remove(&mut self, item: T) {
-        let location = self.items.get(&item).expect("Removal item not found.");
-        let (level, x, y, i) = *location;
-        let node = self.get_node_mut(level, x, y);
-
-        assert!(
-            node.items[i].1 == item,
-            "Item not found at the expected location."
-        );
-
-        let last_idx = node.items.len() - 1;
-        if i != last_idx {
-            node.items.swap_remove(i);
-            let moved_item = node.items[i].1.clone();
-            self.items.get_mut(&moved_item).unwrap().3 = i;
-        } else {
-            node.items.pop();
-        }
-
-        self.items.remove(&item);
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn remove(&mut self, handle: ItemHandle) {
+        let location = self.slots.get(handle);
+        let (level, x, y) = location.coord();
+        let entry = self.take_entry(level, x, y, location.index as usize);
+        debug_assert_eq!(entry.handle, handle);
+        self.slots.free(handle);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the quadtree.
-    pub fn update(&mut self, bounds: Rectangle, item: T) {
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
         let curt_coord = self.position(&bounds);
-        let prev_location = self.items.get_mut(&item).expect("Update item not found.");
-        let (level, x, y, i) = *prev_location;
-        let prev_coord = (level, x, y);
+        let location = self.slots.get(handle);
+        let prev_coord @ (level, x, y) = location.coord();
+        let i = location.index as usize;
 
         if curt_coord == prev_coord {
-            self.get_node_mut(level, x, y).update(bounds, i);
+            self.layers[level][y][x].items[i].bounds = bounds;
             return;
         }
 
         let (nl, nx, ny) = curt_coord;
-        let (ol, ox, oy) = prev_coord;
-
+        let entry = self.take_entry(level, x, y, i);
         let new_node = &mut self.layers[nl][ny][nx];
+        *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
+        new_node.items.push(Entry { bounds, ..entry });
+    }
 
-        prev_location.0 = nl;
-        prev_location.1 = nx;
-        prev_location.2 = ny;
-        prev_location.3 = new_node.items.len();
-
-        new_node.add(bounds, item);
-
-        let old_node = &mut self.layers[ol][oy][ox];
-        let last_idx = old_node.items.len() - 1;
-        if i != last_idx {
-            old_node.items.swap_remove(i);
-            let moved_item = old_node.items[i].1.clone();
-            self.items.get_mut(&moved_item).unwrap().3 = i;
-        } else {
-            old_node.items.pop();
+    /// Take the entry at `index` out of a node. The entry that fills the gap
+    /// has its slot updated, so handles stay valid without any lookup.
+    ///
+    /// Takes plain coordinates rather than a `GridLocation`: keeping the whole
+    /// location alive across `update` measured several percent slower.
+    fn take_entry(&mut self, level: usize, x: usize, y: usize, index: usize) -> Entry<T> {
+        let node = &mut self.layers[level][y][x];
+        let entry = node.items.swap_remove(index);
+        if let Some(moved) = node.items.get(index) {
+            self.slots.get_mut(moved.handle).index = index as u32;
         }
+        entry
     }
 
     /// Search from the bottom up. Execute the callback function for each item found.
@@ -342,41 +327,26 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> UpSearchQuadTreeOriginal<T, MAX_L
     }
 }
 
-struct UpSearchQuadTreeNode<T: Copy + Eq> {
-    items: Vec<(Rectangle, T)>,
+struct UpSearchQuadTreeNode<T: Copy> {
+    items: Vec<Entry<T>>,
 }
 
-impl<T: Copy + Eq> UpSearchQuadTreeNode<T> {
+impl<T: Copy> UpSearchQuadTreeNode<T> {
     fn new() -> Self {
         Self { items: Vec::new() }
-    }
-
-    fn add(&mut self, bounds: Rectangle, item: T) {
-        self.items.push((bounds, item));
-    }
-
-    fn update(&mut self, bounds: Rectangle, index: usize) {
-        let (b, _) = &mut self.items[index];
-        *b = bounds;
     }
 
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         self.items
             .iter()
-            .filter(|(b, _)| b.intersects(bounds))
-            .for_each(|(_, item)| callback(*item));
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
     }
 
     fn iter_items(&self, callback: &mut impl FnMut(T)) {
-        self.items.iter().for_each(|(_, item)| callback(*item));
+        self.items.iter().for_each(|entry| callback(entry.item));
     }
 }
 
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Send
-    for UpSearchQuadTreeOriginal<T, MAX_LEVEL>
-{
-}
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8> Sync
-    for UpSearchQuadTreeOriginal<T, MAX_LEVEL>
-{
-}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {}

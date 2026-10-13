@@ -1,19 +1,20 @@
+use crate::handle::{Entry, ItemHandle, NodeLocation, Slots};
 use crate::rect::Rectangle;
 
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::ptr;
 
-pub struct LooseQuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
+/// Where the entry of each live handle is stored.
+type NodeSlots<T, const MAX_LEVEL: u8, const MAX_ITEMS: usize> =
+    Slots<NodeLocation<LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>>;
+
+pub struct LooseQuadTree<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
     pub root: Box<LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
-    items: HashMap<T, *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>,
+    slots: NodeSlots<T, MAX_LEVEL, MAX_ITEMS>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
-    LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
-{
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS> {
     pub fn new(world_bounds: Rectangle) -> LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS> {
         Self::create::<false>(world_bounds)
     }
@@ -59,7 +60,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             )),
             root_bounds,
             world_bounds,
-            items: HashMap::new(),
+            slots: Slots::new(),
         }
     }
 
@@ -68,75 +69,98 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         &self.root_bounds
     }
 
-    /// Insert an item into the LooseQuadTree.
-    pub fn insert(&mut self, bounds: Rectangle, item: T) {
-        self.items.insert(item, std::ptr::null_mut());
-        if self.world_bounds.contains_point(bounds.get_center()) {
-            self.root.insert(bounds, item, &mut self.items);
+    /// Insert an item into the LooseQuadTree and return the handle that
+    /// identifies it for [`update`](Self::update) and [`remove`](Self::remove).
+    pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
+        // `add` records the location once the entry has reached its node.
+        let handle = self.slots.allocate(NodeLocation::detached());
+        let entry = Entry {
+            bounds,
+            item,
+            handle,
+        };
+        if self.world_bounds.contains_point(entry.bounds.get_center()) {
+            self.root.insert(entry, &mut self.slots);
         } else {
-            self.root.add(bounds, item, &mut self.items);
+            self.root.add(entry, &mut self.slots);
         }
+        handle
     }
 
     /// Remove an item from the LooseQuadTree.
-    pub fn remove(&mut self, item: T) {
-        let node = self.items.get(&item).expect("Removal item not found.");
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn remove(&mut self, handle: ItemHandle) {
+        let NodeLocation { node, index } = self.slots.get(handle);
 
-        let node = unsafe { &mut **node };
-        node.remove(item);
+        let node = unsafe { &mut *node };
+        let entry = node.take_entry(index as usize, &mut self.slots);
+        debug_assert_eq!(entry.handle, handle);
 
-        self.items.remove(&item);
+        self.slots.free(handle);
         LooseQuadTree::merge(node);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the LooseQuadTree.
-    pub fn update(&mut self, bounds: Rectangle, item: T) {
-        let item_locations = &mut self.items;
-        let old_node = item_locations.get(&item).expect("Update item not found.");
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        let NodeLocation {
+            node: old_node,
+            index,
+        } = self.slots.get(handle);
 
         unsafe {
-            let old_node = *old_node;
             let new_node = {
-                let mut new_node = &mut *old_node;
                 let (x, y) = bounds.get_center();
-                while !new_node.loose_bounds.scale(0.5).contains_point((x, y))
-                    && new_node.level != 1
-                {
-                    new_node = &mut *new_node.parent;
-                }
-
                 let width = bounds.get_width();
                 let height = bounds.get_height();
-                let mut new_node = new_node as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
-                while let Some(children) = (*new_node).children.as_mut() {
-                    if width > (*new_node).loose_bounds.get_width() / 4.0
-                        || height > (*new_node).loose_bounds.get_height() / 4.0
+
+                let new_node = if !self.world_bounds.contains_point((x, y)) {
+                    // Mirror `insert`: an item whose center left the world belongs to the root.
+                    &mut *self.root as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>
+                } else {
+                    // Climb while `insert` would not have descended this far: a node
+                    // only holds items that fit half its loose bounds and whose center
+                    // lies in its own (unloosened) area.
+                    let mut new_node = &mut *old_node;
+                    while new_node.level != 1
+                        && (width > new_node.loose_bounds.get_width() / 2.0
+                            || height > new_node.loose_bounds.get_height() / 2.0
+                            || !new_node.loose_bounds.scale(0.5).contains_point((x, y)))
                     {
-                        break;
+                        new_node = &mut *new_node.parent;
                     }
 
-                    let [tl, tr, bl, br] = children.as_mut();
-                    let (x, y) = bounds.get_center();
-                    let (center_x, center_y) = (*new_node).loose_bounds.get_center();
-                    if y < center_y {
-                        if x < center_x {
-                            new_node = tl as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
-                            continue;
-                        } else {
-                            new_node = tr as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
-                            continue;
+                    // Then descend exactly like `insert` does.
+                    let mut new_node = new_node as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
+                    while let Some(children) = (*new_node).children.as_mut() {
+                        if width > (*new_node).loose_bounds.get_width() / 4.0
+                            || height > (*new_node).loose_bounds.get_height() / 4.0
+                        {
+                            break;
                         }
-                    } else if x < center_x {
-                        new_node = bl as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
-                        continue;
-                    } else {
-                        new_node = br as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
-                        continue;
+
+                        let [tl, tr, bl, br] = children.as_mut();
+                        let (center_x, center_y) = (*new_node).loose_bounds.get_center();
+                        if y < center_y {
+                            if x < center_x {
+                                new_node = tl as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
+                            } else {
+                                new_node = tr as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
+                            }
+                        } else if x < center_x {
+                            new_node = bl as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
+                        } else {
+                            new_node = br as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
+                        }
                     }
-                }
+                    new_node
+                };
 
                 if new_node == old_node {
-                    (*old_node).update(bounds, item);
+                    let old_node = &mut *old_node;
+                    old_node.items[index as usize].bounds = bounds;
                     return;
                 }
 
@@ -146,8 +170,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             let old_node = &mut *old_node;
             let new_node = &mut *new_node;
 
-            old_node.remove(item);
-            new_node.add(bounds, item, item_locations);
+            let entry = old_node.take_entry(index as usize, &mut self.slots);
+            new_node.add(Entry { bounds, ..entry }, &mut self.slots);
 
             LooseQuadTree::merge(old_node);
         }
@@ -174,15 +198,15 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     }
 }
 
-pub struct LooseQuadTreeNode<T: Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
+pub struct LooseQuadTreeNode<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
     pub level: u8,
-    pub items: Vec<(Rectangle, T)>,
+    items: Vec<Entry<T>>,
     pub loose_bounds: Rectangle,
     pub children: Option<Box<[LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>; 4]>>,
     parent: *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>
 {
     fn new(
@@ -203,34 +227,31 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         LooseQuadTreeNode::new(self.level + 1, rect, self as *mut Self)
     }
 
-    fn add(&mut self, bounds: Rectangle, item: T, item_locations: &mut HashMap<T, *mut Self>) {
-        *item_locations.get_mut(&item).unwrap() = self as *mut Self;
-        self.items.push((bounds, item));
-        self.split(item_locations);
+    /// Store `entry` in this node and record where it went.
+    fn add(&mut self, entry: Entry<T>, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
+        *slots.get_mut(entry.handle) = NodeLocation {
+            node: self,
+            index: self.items.len() as u32,
+        };
+        self.items.push(entry);
+        self.split(slots);
     }
 
-    fn update(&mut self, bounds: Rectangle, item: T) {
-        let (b, _) = self
-            .items
-            .iter_mut()
-            .find(|(_, stored)| *stored == item)
-            .expect("Item not found");
-
-        *b = bounds;
+    /// Take the entry at `index` out of this node. The entry that fills the
+    /// gap has its slot updated, so handles stay valid without any lookup.
+    fn take_entry(
+        &mut self,
+        index: usize,
+        slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>,
+    ) -> Entry<T> {
+        let entry = self.items.swap_remove(index);
+        if let Some(moved) = self.items.get(index) {
+            slots.get_mut(moved.handle).index = index as u32;
+        }
+        entry
     }
 
-    fn remove(&mut self, item: T) -> T {
-        let i = self
-            .items
-            .iter()
-            .position(|(_, stored)| *stored == item)
-            .expect("Item not found.");
-
-        let (_, item) = self.items.remove(i);
-        item
-    }
-
-    fn split(&mut self, item_locations: &mut HashMap<T, *mut Self>) {
+    fn split(&mut self, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         if self.children.is_some() || self.items.len() <= MAX_ITEMS || self.level >= MAX_LEVEL {
             return;
         }
@@ -256,13 +277,14 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
 
         self.children = Some(Box::new(children));
         let items = std::mem::replace(&mut self.items, Vec::with_capacity(MAX_ITEMS));
-        items.into_iter().for_each(|(bounds, item)| {
-            self.insert(bounds, item, item_locations);
+        items.into_iter().for_each(|entry| {
+            self.insert(entry, slots);
         });
     }
 
-    fn insert(&mut self, bounds: Rectangle, item: T, item_locations: &mut HashMap<T, *mut Self>) {
+    fn insert(&mut self, entry: Entry<T>, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         if let Some(children) = self.children.as_mut() {
+            let bounds = &entry.bounds;
             if bounds.get_width() <= self.loose_bounds.get_width() / 4.0
                 && bounds.get_height() <= self.loose_bounds.get_height() / 4.0
             {
@@ -271,21 +293,21 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
                 let (center_x, center_y) = self.loose_bounds.get_center();
                 if y < center_y {
                     if x < center_x {
-                        return tl.insert(bounds, item, item_locations);
+                        return tl.insert(entry, slots);
                     } else {
-                        return tr.insert(bounds, item, item_locations);
+                        return tr.insert(entry, slots);
                     }
                 } else if x < center_x {
-                    return bl.insert(bounds, item, item_locations);
+                    return bl.insert(entry, slots);
                 } else {
-                    return br.insert(bounds, item, item_locations);
+                    return br.insert(entry, slots);
                 }
             }
         }
 
         // The item is not contained in any child.
         // So insert it into self here.
-        self.add(bounds, item, item_locations);
+        self.add(entry, slots);
     }
 
     fn search(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
@@ -325,16 +347,16 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         self.items
             .iter()
-            .filter(|(b, _)| b.intersects(bounds))
-            .for_each(|(_, item)| callback(*item));
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
     }
 }
 
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
+unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
     for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
+unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
     for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }

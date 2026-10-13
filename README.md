@@ -16,7 +16,7 @@ Both methods access nodes directly through grid coordinates, avoiding the recurs
 
 - **Fewer search-path decisions.** Grid coordinates directly identify nodes and their parents, avoiding the node-bound intersection checks used to select branches during recursive search.
 - **Smaller nodes.** `UpSearchQuadTree` stores object bounds and IDs without storing node bounds or child pointers.
-- **Low object-management overhead.** Insertion positions are computed in O(1) time. With the location index, insertions and updates take expected amortized O(1) time, and removals take expected O(1) time.
+- **Low object-management overhead.** Insertion positions are computed in O(1) time. `insert` returns an `ItemHandle` that records where the object is stored, so `update` and `remove` reach the object directly in O(1) time, without hashing the object or scanning its node. The object type only needs to be `Copy`.
 - **Approximate ordering by object size.** Scanning from the lowest layer upward tends to return smaller objects before larger ones, although objects within each layer are not sorted by size.
 
 ## Disadvantages
@@ -24,6 +24,21 @@ Both methods access nodes directly through grid coordinates, avoiding the recurs
 - **Memory overhead from preallocated grids.** Empty nodes also occupy space, making the structure less economical for sparse scenes. For square world bounds, adding a layer roughly quadruples the grid storage.
 - **Empty-cell scans for large queries.** Deeper layers are scanned over rectangular ranges, including empty cells. Search cost therefore depends on the number of grid cells covered as well as the number of objects.
 - **Sensitivity to object distribution.** Objects concentrated in a few nodes, or many large objects stored in upper layers, can require numerous candidate intersection checks. In the worst case, all stored objects may need to be examined.
+
+## Usage
+
+Every quadtree in this repository shares the same item management: `insert` hands back an `ItemHandle`, which `update` and `remove` take instead of the item itself.
+
+```rust
+let mut tree = UpSearchQuadTree::<usize, MAX_LEVEL>::new(world_bounds);
+
+let handle = tree.insert(ball.get_bounds(), id);
+tree.search(&query_bounds, |other_id| { /* ... */ });
+tree.update(ball.get_bounds(), handle);
+tree.remove(handle);
+```
+
+Handles are small `Copy` values. Using a handle after `remove` panics, even if its slot has been reused by a later `insert`.
 
 ## Quadtrees Included in This Repository
 
@@ -44,3 +59,10 @@ The following results were previously recorded for 10,000 searches among 10,000 
 | QuadTree | LooseQuadTree | UpSearchQuadTree |
 |:--------:|:-------------:|:----------------:|
 | 4.62 ms  | 3.36 ms       | 2.28 ms          |
+
+`cargo bench --bench update` measures item management on the same 10,000 balls: moving every ball one step and updating its bounds (`update`), and removing every ball and inserting it again (`reinsert`). Both go through handles, so no hashing is involved:
+
+|          | QuadTree | LooseQuadTree | UpSearchQuadTree |
+|:--------:|:--------:|:-------------:|:----------------:|
+| update   | 87 µs    | 77 µs         | 75 µs            |
+| reinsert | 541 µs   | 415 µs        | 275 µs           |

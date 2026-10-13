@@ -1,19 +1,20 @@
+use crate::handle::{Entry, ItemHandle, NodeLocation, Slots};
 use crate::rect::Rectangle;
 
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::ptr;
 
+/// Where the entry of each live handle is stored.
+type NodeSlots<T, const MAX_LEVEL: u8, const MAX_ITEMS: usize> =
+    Slots<NodeLocation<QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>>;
+
 /// An implementation of a quadtree that can be dynamically updated.
-pub struct QuadTree<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
+pub struct QuadTree<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
     root: Box<QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>,
     world_bounds: Rectangle,
-    items: HashMap<T, *mut QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>,
+    slots: NodeSlots<T, MAX_LEVEL, MAX_ITEMS>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
-    QuadTree<T, MAX_LEVEL, MAX_ITEMS>
-{
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QuadTree<T, MAX_LEVEL, MAX_ITEMS> {
     /// Create a new quadtree with the given bounds.
     ///
     /// Force using a square as the bounds of each node. This usually makes searches more efficient.
@@ -41,7 +42,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
                 ptr::null_mut(),
             )),
             world_bounds,
-            items: HashMap::new(),
+            slots: Slots::new(),
         }
     }
 
@@ -63,7 +64,7 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
                 ptr::null_mut(),
             )),
             world_bounds,
-            items: HashMap::new(),
+            slots: Slots::new(),
         }
     }
 
@@ -72,34 +73,48 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         &self.root.bounds
     }
 
-    /// Insert an item into the quadtree.
-    pub fn insert(&mut self, bounds: Rectangle, item: T) {
-        self.items.insert(item, std::ptr::null_mut());
-        if self.world_bounds.contains(&bounds) {
-            self.root.insert(bounds, item, &mut self.items);
+    /// Insert an item into the quadtree and return the handle that identifies
+    /// it for [`update`](Self::update) and [`remove`](Self::remove).
+    pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
+        // `add` records the location once the entry has reached its node.
+        let handle = self.slots.allocate(NodeLocation::detached());
+        let entry = Entry {
+            bounds,
+            item,
+            handle,
+        };
+        if self.world_bounds.contains(&entry.bounds) {
+            self.root.insert(entry, &mut self.slots);
         } else {
-            self.root.add(bounds, item, &mut self.items);
+            self.root.add(entry, &mut self.slots);
         }
+        handle
     }
 
     /// Remove an item from the quadtree.
-    pub fn remove(&mut self, item: T) {
-        let node = self.items.get(&item).expect("Removal item not found.");
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn remove(&mut self, handle: ItemHandle) {
+        let NodeLocation { node, index } = self.slots.get(handle);
 
-        let node = unsafe { &mut **node };
-        node.remove(item);
+        let node = unsafe { &mut *node };
+        let entry = node.take_entry(index as usize, &mut self.slots);
+        debug_assert_eq!(entry.handle, handle);
 
-        self.items.remove(&item);
+        self.slots.free(handle);
         QuadTree::merge(node);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the quadtree.
-    pub fn update(&mut self, bounds: Rectangle, item: T) {
-        let item_locations = &mut self.items;
-        let old_node = item_locations.get(&item).expect("Update item not found.");
+    ///
+    /// Panics if the handle has already been removed.
+    pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        let NodeLocation {
+            node: old_node,
+            index,
+        } = self.slots.get(handle);
 
         unsafe {
-            let old_node = *old_node;
             let new_node = {
                 let mut new_node = &mut *old_node;
                 while !new_node.bounds.contains(&bounds) && new_node.level != 1 {
@@ -133,7 +148,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
                 }
 
                 if new_node == old_node {
-                    (*old_node).update(bounds, item);
+                    let old_node = &mut *old_node;
+                    old_node.items[index as usize].bounds = bounds;
                     return;
                 }
 
@@ -143,8 +159,8 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             let old_node = &mut *old_node;
             let new_node = &mut *new_node;
 
-            old_node.remove(item);
-            new_node.add(bounds, item, item_locations);
+            let entry = old_node.take_entry(index as usize, &mut self.slots);
+            new_node.add(Entry { bounds, ..entry }, &mut self.slots);
 
             QuadTree::merge(old_node);
         }
@@ -171,17 +187,15 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     }
 }
 
-pub struct QuadTreeNode<T: Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
+pub struct QuadTreeNode<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> {
     level: u8,
-    items: Vec<(Rectangle, T)>,
+    items: Vec<Entry<T>>,
     bounds: Rectangle,
     children: Option<Box<[QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>; 4]>>,
     parent: *mut QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>,
 }
 
-impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
-    QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>
-{
+impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QuadTreeNode<T, MAX_LEVEL, MAX_ITEMS> {
     fn new(
         lv: u8,
         bounds: Rectangle,
@@ -200,34 +214,31 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         QuadTreeNode::new(self.level + 1, rect, self as *mut Self)
     }
 
-    fn add(&mut self, bounds: Rectangle, item: T, item_locations: &mut HashMap<T, *mut Self>) {
-        *item_locations.get_mut(&item).unwrap() = self as *mut Self;
-        self.items.push((bounds, item));
-        self.split(item_locations);
+    /// Store `entry` in this node and record where it went.
+    fn add(&mut self, entry: Entry<T>, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
+        *slots.get_mut(entry.handle) = NodeLocation {
+            node: self,
+            index: self.items.len() as u32,
+        };
+        self.items.push(entry);
+        self.split(slots);
     }
 
-    fn update(&mut self, bounds: Rectangle, item: T) {
-        let (b, _) = self
-            .items
-            .iter_mut()
-            .find(|(_, stored)| *stored == item)
-            .expect("Item not found");
-
-        *b = bounds;
+    /// Take the entry at `index` out of this node. The entry that fills the
+    /// gap has its slot updated, so handles stay valid without any lookup.
+    fn take_entry(
+        &mut self,
+        index: usize,
+        slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>,
+    ) -> Entry<T> {
+        let entry = self.items.swap_remove(index);
+        if let Some(moved) = self.items.get(index) {
+            slots.get_mut(moved.handle).index = index as u32;
+        }
+        entry
     }
 
-    fn remove(&mut self, item: T) -> T {
-        let i = self
-            .items
-            .iter()
-            .position(|(_, stored)| *stored == item)
-            .expect("Item not found.");
-
-        let (_, item) = self.items.remove(i);
-        item
-    }
-
-    fn split(&mut self, item_locations: &mut HashMap<T, *mut Self>) {
+    fn split(&mut self, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         if self.children.is_some() || self.items.len() <= MAX_ITEMS || self.level >= MAX_LEVEL {
             return;
         }
@@ -255,34 +266,35 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         let items = std::mem::replace(&mut self.items, Vec::with_capacity(MAX_ITEMS));
         items
             .into_iter()
-            .for_each(|(bounds, item)| self.insert(bounds, item, item_locations));
+            .for_each(|entry| self.insert(entry, slots));
     }
 
-    fn insert(&mut self, bounds: Rectangle, item: T, item_locations: &mut HashMap<T, *mut Self>) {
+    fn insert(&mut self, entry: Entry<T>, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         if let Some(children) = self.children.as_mut() {
             let [tl, tr, bl, br] = children.as_mut();
             // The center of this node
             let (x, y) = tl.bounds.get_max();
+            let bounds = &entry.bounds;
             if bounds.max_y < y {
                 if bounds.max_x < x {
-                    return tl.insert(bounds, item, item_locations);
+                    return tl.insert(entry, slots);
                 }
                 if bounds.min_x > x {
-                    return tr.insert(bounds, item, item_locations);
+                    return tr.insert(entry, slots);
                 }
             } else if bounds.min_y > y {
                 if bounds.max_x < x {
-                    return bl.insert(bounds, item, item_locations);
+                    return bl.insert(entry, slots);
                 }
                 if bounds.min_x > x {
-                    return br.insert(bounds, item, item_locations);
+                    return br.insert(entry, slots);
                 }
             }
         }
 
         // The item is not contained in any child.
         // So insert it into self here.
-        self.add(bounds, item, item_locations);
+        self.add(entry, slots);
     }
 
     fn search(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
@@ -314,16 +326,16 @@ impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         self.items
             .iter()
-            .filter(|(b, _)| b.intersects(bounds))
-            .for_each(|(_, item)| callback(*item));
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
     }
 }
 
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
+unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
     for QuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }
-unsafe impl<T: Copy + Eq + Hash, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
+unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
     for QuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }

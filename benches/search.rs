@@ -1,4 +1,5 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{BenchmarkGroup, Criterion, criterion_group, criterion_main};
 use rand::*;
 use std::hint::black_box;
 
@@ -15,25 +16,22 @@ const BOUND_HEIGHT: f64 = 20000.0;
 const AMOUNT: usize = 10000;
 const SEED: u64 = 0;
 
-// level 9~10 size
+// Diameters of 50 to 100, the size of levels 8 to 9; with `MAX_LEVEL` 7,
+// balls that do not double sit on the finest level.
 const MIN_RADIUS: f64 = 25.0;
 const MAX_RADIUS: f64 = 50.0;
 
 const BOUNDS: Rectangle = Rectangle::new(0.0, 0.0, BOUND_WIDTH, BOUND_HEIGHT);
 
-/// Cell size of the uniform grids: the finest node size of the quadtrees.
+/// Cell size of the uniform grids: the finest cell size of the hierarchical
+/// structures, 312.5.
 const GRID_CELL_SIZE: f64 = BOUND_WIDTH / (1u32 << (MAX_LEVEL - 1)) as f64;
 
 trait QTree<T> {
     fn insert_item(&mut self, bounds: Rectangle, item: T);
-}
-
-impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
-    for QuadTree<T, MAX_LEVEL, MAX_ITEMS>
-{
-    fn insert_item(&mut self, bounds: Rectangle, item: T) {
-        self.insert(bounds, item);
-    }
+    /// Called once after a scene is built, like the end of a frame, so that
+    /// lazy structures bring their bounds up to date.
+    fn end_frame(&mut self) {}
 }
 
 impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
@@ -44,21 +42,51 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> QTree<T>
     }
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for GridLooseQuadTree<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for HierarchicalLooseGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTree<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for OverflowBoundGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for UpSearchQuadTreeOriginal<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for LazyOverflowBoundGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for BoxedOverflowBoundGrid<T, MAX_LEVEL> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for StripedOverflowBoundGrid<T, MAX_LEVEL> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
     }
 }
 
@@ -68,19 +96,41 @@ impl<T: Copy> QTree<T> for UniformGrid<T> {
     }
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for MultiLayerGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for HierarchicalGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) {
         self.insert(bounds, item);
     }
 }
 
+impl<T: Copy> QTree<T> for StripedGrid<T> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) {
+        self.insert(bounds, item);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+/// Half the finest cell size, which the small balls still fit.
+const HALF_CELL_SIZE: f64 = GRID_CELL_SIZE / 2.0;
+
 fn gen_balls(quadtree: &mut impl QTree<usize>, count: usize, seed: u64) -> Vec<Rectangle> {
+    gen_balls_doubling(quadtree, count, seed, 5)
+}
+
+/// Like [`gen_balls`], but the radius doubles at most `doublings` times.
+fn gen_balls_doubling(
+    quadtree: &mut impl QTree<usize>,
+    count: usize,
+    seed: u64,
+    doublings: usize,
+) -> Vec<Rectangle> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut balls = Vec::with_capacity(count);
     for _ in 0..count {
         let (x, y) = BOUNDS.get_random_point(&mut rng);
         let mut r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
-        for _ in 0..5 {
+        for _ in 0..doublings {
             if rng.gen_bool(0.25) {
                 r *= 2.0;
             } else {
@@ -102,23 +152,8 @@ fn gen_balls(quadtree: &mut impl QTree<usize>, count: usize, seed: u64) -> Vec<R
         .collect::<Vec<_>>()
 }
 
-fn quadtree(c: &mut Criterion) {
-    let mut quadtree_normal = QuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_normal, AMOUNT, SEED);
-
-    c.bench_function("QuadTree", |b| {
-        b.iter(|| {
-            bounds_cache.iter().for_each(|bounds| {
-                quadtree_normal.search(bounds, |id| {
-                    black_box(id);
-                });
-            });
-        });
-    });
-}
-
 fn quadtree_loose(c: &mut Criterion) {
-    let mut quadtree_loose = LooseQuadTree::<usize, MAX_LEVEL, 8>::new(BOUNDS.clone());
+    let mut quadtree_loose = LooseQuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(BOUNDS.clone());
     let bounds_cache = gen_balls(&mut quadtree_loose, AMOUNT, SEED);
 
     c.bench_function("LooseQuadTree", |b| {
@@ -132,14 +167,15 @@ fn quadtree_loose(c: &mut Criterion) {
     });
 }
 
-fn quadtree_gl(c: &mut Criterion) {
-    let mut quadtree_gl = GridLooseQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_gl, AMOUNT, SEED);
+fn grid_hierarchical_loose(c: &mut Criterion) {
+    let mut grid_hierarchical_loose =
+        HierarchicalLooseGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid_hierarchical_loose, AMOUNT, SEED);
 
-    c.bench_function("GridLooseQuadTree", |b| {
+    c.bench_function("HierarchicalLooseGrid", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
-                quadtree_gl.search_up(bounds, |id| {
+                grid_hierarchical_loose.search(bounds, |id| {
                     black_box(id);
                 });
             });
@@ -147,14 +183,14 @@ fn quadtree_gl(c: &mut Criterion) {
     });
 }
 
-fn quadtree_us(c: &mut Criterion) {
-    let mut quadtree_us = UpSearchQuadTree::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_us, AMOUNT, SEED);
+fn grid_overflow_exact(c: &mut Criterion) {
+    let mut grid = OverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
 
-    c.bench_function("UpSearchQuadTree", |b| {
+    c.bench_function("OverflowBoundGrid", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
-                quadtree_us.search(bounds, |id| {
+                grid.search(bounds, |id| {
                     black_box(id);
                 });
             });
@@ -162,14 +198,84 @@ fn quadtree_us(c: &mut Criterion) {
     });
 }
 
-fn quadtree_uso(c: &mut Criterion) {
-    let mut quadtree_uso = UpSearchQuadTreeOriginal::<usize, MAX_LEVEL>::new(BOUNDS.clone());
-    let bounds_cache = gen_balls(&mut quadtree_uso, AMOUNT, SEED);
+fn grid_overflow_lazy(c: &mut Criterion) {
+    let mut grid = LazyOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+    // Insertion alone leaves the bounds exact; refreshing changes nothing.
+    grid.refresh_bounds();
 
-    c.bench_function("UpSearchQuadTreeOriginal", |b| {
+    c.bench_function("LazyOverflowBoundGrid", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
-                quadtree_uso.search(bounds, |id| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn grid_overflow_boxed(c: &mut Criterion) {
+    let mut grid = BoxedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+    // Insertion alone leaves boxes and bounds exact; refreshing changes nothing.
+    grid.refresh_bounds();
+
+    c.bench_function("BoxedOverflowBoundGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn grid_overflow_striped(c: &mut Criterion) {
+    let mut grid = StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+    // Insertion alone leaves boxes and spans exact; refreshing changes nothing.
+    grid.refresh_bounds();
+
+    c.bench_function("StripedOverflowBoundGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn grid_overflow_incoming(c: &mut Criterion) {
+    let mut grid = IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+    // Insertion leaves boxes and spans exact, but only the refresh fills the
+    // copies of the neighbors' sides and clears the stale marks.
+    grid.refresh_bounds();
+
+    c.bench_function("IncomingOverflowBoundGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
+                    black_box(id);
+                });
+            });
+        });
+    });
+}
+
+fn striped_grid(c: &mut Criterion) {
+    let mut grid = StripedGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE);
+    let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
+    grid.refresh_bounds();
+
+    c.bench_function("StripedGrid", |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| {
+                grid.search(bounds, |id| {
                     black_box(id);
                 });
             });
@@ -192,11 +298,11 @@ fn grid_uniform(c: &mut Criterion) {
     });
 }
 
-fn grid_multi_layer(c: &mut Criterion) {
-    let mut grid = MultiLayerGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
+fn grid_hierarchical(c: &mut Criterion) {
+    let mut grid = HierarchicalGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone());
     let bounds_cache = gen_balls(&mut grid, AMOUNT, SEED);
 
-    c.bench_function("MultiLayerGrid", |b| {
+    c.bench_function("HierarchicalGrid", |b| {
         b.iter(|| {
             bounds_cache.iter().for_each(|bounds| {
                 grid.search(bounds, |id| {
@@ -207,14 +313,462 @@ fn grid_multi_layer(c: &mut Criterion) {
     });
 }
 
+/// Search with every ball's bounds among balls that never double. All fit far
+/// below the finest cell size, where overflow bounds narrow the scan.
+fn bench_small_balls<Tree: QTree<usize>>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut tree: Tree,
+    search: impl Fn(&Tree, &Rectangle),
+) {
+    let bounds_cache = gen_balls_doubling(&mut tree, AMOUNT, SEED, 0);
+    tree.end_frame();
+
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            bounds_cache.iter().for_each(|bounds| search(&tree, bounds));
+        });
+    });
+}
+
+fn small_balls(c: &mut Criterion) {
+    let mut group = c.benchmark_group("small_balls");
+    bench_small_balls(
+        &mut group,
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_small_balls(
+        &mut group,
+        "OverflowBoundGrid",
+        OverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_small_balls(
+        &mut group,
+        "LazyOverflowBoundGrid",
+        LazyOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_small_balls(
+        &mut group,
+        "BoxedOverflowBoundGrid",
+        BoxedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_small_balls(
+        &mut group,
+        "StripedOverflowBoundGrid",
+        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_small_balls(
+        &mut group,
+        "IncomingOverflowBoundGrid",
+        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    for (name, cell) in [("312", GRID_CELL_SIZE), ("156", HALF_CELL_SIZE)] {
+        bench_small_balls(
+            &mut group,
+            &format!("UniformGrid/{name}"),
+            UniformGrid::<usize>::new(BOUNDS.clone(), cell),
+            |tree, bounds| {
+                tree.search(bounds, |id| {
+                    black_box(id);
+                })
+            },
+        );
+        bench_small_balls(
+            &mut group,
+            &format!("StripedGrid/{name}"),
+            StripedGrid::<usize>::new(BOUNDS.clone(), cell),
+            |tree, bounds| {
+                tree.search(bounds, |id| {
+                    black_box(id);
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Items that keep off their cell edges: two per finest cell, near its center
+/// and well below its size, so no item reaches the edges of its cell.
+fn gen_aligned(tree: &mut impl QTree<usize>) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+    let cells = (BOUND_WIDTH / GRID_CELL_SIZE) as usize;
+    let mut id = 0;
+    for y in 0..cells {
+        for x in 0..cells {
+            for _ in 0..2 {
+                let cx = (x as f64 + 0.5) * GRID_CELL_SIZE + rng.gen_range(-30.0..30.0);
+                let cy = (y as f64 + 0.5) * GRID_CELL_SIZE + rng.gen_range(-30.0..30.0);
+                let w = rng.gen_range(60.0..180.0);
+                let h = rng.gen_range(60.0..180.0);
+                tree.insert_item(Rectangle::center_rect(cx, cy, w, h), id);
+                id += 1;
+            }
+        }
+    }
+}
+
+/// Query rectangles anywhere in the world, with sides drawn from `sizes`.
+fn aligned_queries(count: usize, sizes: std::ops::Range<f64>, seed: u64) -> Vec<Rectangle> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    (0..count)
+        .map(|_| {
+            let (x, y) = BOUNDS.get_random_point(&mut rng);
+            let w = rng.gen_range(sizes.clone());
+            let h = rng.gen_range(sizes.clone());
+            Rectangle::center_rect(x, y, w, h)
+        })
+        .collect()
+}
+
+fn bench_aligned<Tree: QTree<usize>>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut tree: Tree,
+    search: impl Fn(&Tree, &Rectangle),
+) {
+    gen_aligned(&mut tree);
+    tree.end_frame();
+    let small = aligned_queries(AMOUNT, 50.0..300.0, 1);
+    let large = aligned_queries(AMOUNT / 5, 400.0..1500.0, 2);
+    group.bench_function(format!("small/{name}"), |b| {
+        b.iter(|| small.iter().for_each(|bounds| search(&tree, bounds)));
+    });
+    group.bench_function(format!("large/{name}"), |b| {
+        b.iter(|| large.iter().for_each(|bounds| search(&tree, bounds)));
+    });
+}
+
+fn aligned(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aligned");
+    bench_aligned(
+        &mut group,
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "OverflowBoundGrid",
+        OverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "LazyOverflowBoundGrid",
+        LazyOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "BoxedOverflowBoundGrid",
+        BoxedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "StripedOverflowBoundGrid",
+        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "IncomingOverflowBoundGrid",
+        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "UniformGrid/312",
+        UniformGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_aligned(
+        &mut group,
+        "StripedGrid/312",
+        StripedGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    group.finish();
+}
+
+/// Small balls on the finest level and `count` squares on one coarser level.
+/// The width and height of each square are drawn independently from `side`,
+/// so the squares are in general rectangles.
+fn gen_two_tier(count: usize, side: std::ops::Range<f64>) -> (Vec<Rectangle>, Vec<Rectangle>) {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+    let small = (0..AMOUNT)
+        .map(|_| {
+            let (x, y) = BOUNDS.get_random_point(&mut rng);
+            let r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
+            Rectangle::center_rect(x, y, r * 2.0, r * 2.0)
+        })
+        .collect();
+    let large = (0..count)
+        .map(|_| {
+            let (x, y) = BOUNDS.get_random_point(&mut rng);
+            let w = rng.gen_range(side.clone());
+            let h = rng.gen_range(side.clone());
+            Rectangle::center_rect(x, y, w, h)
+        })
+        .collect();
+    (small, large)
+}
+
+fn bench_two_tier<Tree: QTree<usize>>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut tree: Tree,
+    (small, large): &(Vec<Rectangle>, Vec<Rectangle>),
+    search: impl Fn(&Tree, &Rectangle),
+) {
+    for (id, bounds) in small.iter().chain(large).enumerate() {
+        tree.insert_item(bounds.clone(), id);
+    }
+    tree.end_frame();
+    group.bench_function(format!("small/{name}"), |b| {
+        b.iter(|| small.iter().for_each(|bounds| search(&tree, bounds)));
+    });
+    group.bench_function(format!("large/{name}"), |b| {
+        b.iter(|| large.iter().for_each(|bounds| search(&tree, bounds)));
+    });
+}
+
+/// Search with the balls and with the squares of a two-tier scene, then with
+/// the balls after the squares have shrunk onto the finest level without a
+/// refresh. This empties the squares' level, a state that lazy structures
+/// tidy up only in a refresh.
+fn two_tier(c: &mut Criterion, name: &str, scene: (Vec<Rectangle>, Vec<Rectangle>)) {
+    let mut group = c.benchmark_group(name);
+    bench_two_tier(
+        &mut group,
+        "HierarchicalLooseGrid",
+        HierarchicalLooseGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_two_tier(
+        &mut group,
+        "OverflowBoundGrid",
+        OverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_two_tier(
+        &mut group,
+        "LazyOverflowBoundGrid",
+        LazyOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_two_tier(
+        &mut group,
+        "BoxedOverflowBoundGrid",
+        BoxedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_two_tier(
+        &mut group,
+        "StripedOverflowBoundGrid",
+        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_two_tier(
+        &mut group,
+        "IncomingOverflowBoundGrid",
+        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |tree, bounds| {
+            tree.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+
+    bench_stale(
+        &mut group,
+        "BoxedOverflowBoundGrid",
+        BoxedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |grid, bounds, id| grid.insert(bounds, id),
+        |grid, bounds, handle| grid.update(bounds, handle),
+        |grid, bounds| {
+            grid.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_stale(
+        &mut group,
+        "StripedOverflowBoundGrid",
+        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |grid, bounds, id| grid.insert(bounds, id),
+        |grid, bounds, handle| grid.update(bounds, handle),
+        |grid, bounds| {
+            grid.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    bench_stale(
+        &mut group,
+        "IncomingOverflowBoundGrid",
+        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        &scene,
+        |grid, bounds, id| grid.insert(bounds, id),
+        |grid, bounds, handle| grid.update(bounds, handle),
+        |grid, bounds| {
+            grid.search(bounds, |id| {
+                black_box(id);
+            })
+        },
+    );
+    group.finish();
+}
+
+/// Search with the balls after the squares have shrunk onto the finest level
+/// without a refresh, which empties their level.
+fn bench_stale<Tree>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut grid: Tree,
+    (small, large): &(Vec<Rectangle>, Vec<Rectangle>),
+    insert: impl Fn(&mut Tree, Rectangle, usize) -> ItemHandle,
+    update: impl Fn(&mut Tree, Rectangle, ItemHandle),
+    search: impl Fn(&Tree, &Rectangle),
+) {
+    for (id, bounds) in small.iter().enumerate() {
+        insert(&mut grid, bounds.clone(), id);
+    }
+    let handles: Vec<_> = large
+        .iter()
+        .enumerate()
+        .map(|(id, bounds)| insert(&mut grid, bounds.clone(), AMOUNT + id))
+        .collect();
+    for (bounds, handle) in large.iter().zip(handles) {
+        let (x, y) = bounds.get_center();
+        update(&mut grid, Rectangle::center_rect(x, y, 80.0, 80.0), handle);
+    }
+    group.bench_function(format!("stale/{name}"), |b| {
+        b.iter(|| small.iter().for_each(|bounds| search(&grid, bounds)));
+    });
+}
+
+/// 64 squares on level 3, with the levels between them and the balls empty:
+/// the ancestor walk from the finest level passes three empty levels before
+/// it reaches the squares.
+fn gap(c: &mut Criterion) {
+    two_tier(c, "gap", gen_two_tier(64, 2600.0..4900.0));
+}
+
+/// 1,024 squares on level 6, about one per cell, directly above the balls:
+/// the ancestor walk from the finest level reads one more level and skips
+/// none.
+fn adjacent(c: &mut Criterion) {
+    two_tier(c, "adjacent", gen_two_tier(1024, 320.0..620.0));
+}
+
 criterion_group!(
     bench,
-    quadtree,
-    quadtree_uso,
     quadtree_loose,
-    quadtree_gl,
-    quadtree_us,
+    grid_hierarchical_loose,
     grid_uniform,
-    grid_multi_layer,
+    grid_hierarchical,
+    grid_overflow_exact,
+    grid_overflow_lazy,
+    grid_overflow_boxed,
+    grid_overflow_striped,
+    grid_overflow_incoming,
+    grid_uniform,
+    striped_grid,
+    small_balls,
+    aligned,
+    gap,
+    adjacent,
 );
 criterion_main!(bench);

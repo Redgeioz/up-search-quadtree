@@ -17,14 +17,15 @@ const MAX_RADIUS: f64 = 5.0;
 const MIN_VELOCITY: f64 = 0.2;
 const MAX_VELOCITY: f64 = 1.0;
 
-/// Steps of the dynamic check; each one moves, resizes, removes and inserts balls.
+/// Steps of the dynamic check; each moves, resizes, removes and inserts balls.
 const STEPS: usize = 8;
 
 fn world() -> Rectangle {
     Rectangle::new(-128.0, -128.0, BOUND_WIDTH - 128.0, BOUND_HEIGHT - 128.0)
 }
 
-/// A radius that doubles a few times at random, so that balls span many levels.
+/// Random radius, doubled up to seven times at random so that balls span many
+/// levels.
 fn random_radius(rng: &mut impl Rng) -> f64 {
     let mut r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
     for _ in 0..7 {
@@ -50,109 +51,136 @@ fn random_ball(rng: &mut impl Rng, bounds: &Rectangle) -> Ball {
         .build()
 }
 
-/// Every spatial structure of the crate, holding the same balls.
+/// Every spatial structure of the crate except `StripedGrid`, holding the same
+/// balls.
 struct Trees {
-    normal: QuadTree<usize, MAX_LEVEL, MAX_ITEMS>,
     loose: LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>,
-    grid_loose: GridLooseQuadTree<usize, MAX_LEVEL>,
-    up_search: UpSearchQuadTree<usize, MAX_LEVEL>,
-    original: UpSearchQuadTreeOriginal<usize, MAX_LEVEL>,
+    hierarchical_loose: HierarchicalLooseGrid<usize, MAX_LEVEL>,
     uniform: UniformGrid<usize>,
-    multi_layer: MultiLayerGrid<usize, MAX_LEVEL>,
+    hierarchical: HierarchicalGrid<usize, MAX_LEVEL>,
+    overflow_bound: OverflowBoundGrid<usize, MAX_LEVEL>,
+    lazy: LazyOverflowBoundGrid<usize, MAX_LEVEL>,
+    boxed: BoxedOverflowBoundGrid<usize, MAX_LEVEL>,
+    striped: StripedOverflowBoundGrid<usize, MAX_LEVEL>,
+    incoming: IncomingOverflowBoundGrid<usize, MAX_LEVEL>,
 }
 
-/// The handles one ball received from every tree.
+/// Handles of one ball in every structure.
 #[derive(Clone, Copy)]
 struct Handles {
-    normal: ItemHandle,
     loose: ItemHandle,
-    grid_loose: ItemHandle,
-    up_search: ItemHandle,
-    original: ItemHandle,
+    hierarchical_loose: ItemHandle,
     uniform: ItemHandle,
-    multi_layer: ItemHandle,
+    hierarchical: ItemHandle,
+    overflow_bound: ItemHandle,
+    lazy: ItemHandle,
+    boxed: ItemHandle,
+    striped: ItemHandle,
+    incoming: ItemHandle,
 }
 
 impl Trees {
     fn new(world: &Rectangle) -> Self {
         Self {
-            normal: QuadTree::new(world.clone()),
             loose: LooseQuadTree::new(world.clone()),
-            grid_loose: GridLooseQuadTree::new(world.clone()),
-            up_search: UpSearchQuadTree::new(world.clone()),
-            original: UpSearchQuadTreeOriginal::new(world.clone()),
+            hierarchical_loose: HierarchicalLooseGrid::new(world.clone()),
             uniform: UniformGrid::new(world.clone(), UNIFORM_CELL_SIZE),
-            multi_layer: MultiLayerGrid::new(world.clone()),
+            hierarchical: HierarchicalGrid::new(world.clone()),
+            overflow_bound: OverflowBoundGrid::new(world.clone()),
+            lazy: LazyOverflowBoundGrid::new(world.clone()),
+            boxed: BoxedOverflowBoundGrid::new(world.clone()),
+            striped: StripedOverflowBoundGrid::new(world.clone()),
+            incoming: IncomingOverflowBoundGrid::new(world.clone()),
         }
     }
 
     fn insert(&mut self, bounds: &Rectangle, id: usize) -> Handles {
         Handles {
-            normal: self.normal.insert(bounds.clone(), id),
             loose: self.loose.insert(bounds.clone(), id),
-            grid_loose: self.grid_loose.insert(bounds.clone(), id),
-            up_search: self.up_search.insert(bounds.clone(), id),
-            original: self.original.insert(bounds.clone(), id),
+            hierarchical_loose: self.hierarchical_loose.insert(bounds.clone(), id),
             uniform: self.uniform.insert(bounds.clone(), id),
-            multi_layer: self.multi_layer.insert(bounds.clone(), id),
+            hierarchical: self.hierarchical.insert(bounds.clone(), id),
+            overflow_bound: self.overflow_bound.insert(bounds.clone(), id),
+            lazy: self.lazy.insert(bounds.clone(), id),
+            boxed: self.boxed.insert(bounds.clone(), id),
+            striped: self.striped.insert(bounds.clone(), id),
+            incoming: self.incoming.insert(bounds.clone(), id),
         }
     }
 
     fn update(&mut self, bounds: &Rectangle, handles: Handles) {
-        self.normal.update(bounds.clone(), handles.normal);
         self.loose.update(bounds.clone(), handles.loose);
-        self.grid_loose.update(bounds.clone(), handles.grid_loose);
-        self.up_search.update(bounds.clone(), handles.up_search);
-        self.original.update(bounds.clone(), handles.original);
+        self.hierarchical_loose.update(bounds.clone(), handles.hierarchical_loose);
         self.uniform.update(bounds.clone(), handles.uniform);
-        self.multi_layer.update(bounds.clone(), handles.multi_layer);
+        self.hierarchical.update(bounds.clone(), handles.hierarchical);
+        self.overflow_bound
+            .update(bounds.clone(), handles.overflow_bound);
+        self.lazy.update(bounds.clone(), handles.lazy);
+        self.boxed.update(bounds.clone(), handles.boxed);
+        self.striped
+            .update(bounds.clone(), handles.striped);
+        self.incoming
+            .update(bounds.clone(), handles.incoming);
     }
 
     fn remove(&mut self, handles: Handles) {
-        self.normal.remove(handles.normal);
         self.loose.remove(handles.loose);
-        self.grid_loose.remove(handles.grid_loose);
-        self.up_search.remove(handles.up_search);
-        self.original.remove(handles.original);
+        self.hierarchical_loose.remove(handles.hierarchical_loose);
         self.uniform.remove(handles.uniform);
-        self.multi_layer.remove(handles.multi_layer);
+        self.hierarchical.remove(handles.hierarchical);
+        self.overflow_bound.remove(handles.overflow_bound);
+        self.lazy.remove(handles.lazy);
+        self.boxed.remove(handles.boxed);
+        self.striped.remove(handles.striped);
+        self.incoming.remove(handles.incoming);
     }
 
-    /// What every search method finds for `bounds`, excluding `id` itself.
+    /// Tighten the bounds that shrink only on request.
+    fn refresh(&mut self) {
+        self.lazy.refresh_bounds();
+        self.boxed.refresh_bounds();
+        self.striped.refresh_bounds();
+        self.incoming.refresh_bounds();
+    }
+
+    /// Items that each structure's search finds for `bounds`, excluding `id`.
     fn search(&self, bounds: &Rectangle, id: usize) -> Vec<(&'static str, HashSet<usize>)> {
         vec![
-            ("QuadTree", collect(id, |cb| self.normal.search(bounds, cb))),
             (
                 "LooseQuadTree",
                 collect(id, |cb| self.loose.search(bounds, cb)),
             ),
             (
-                "GridLooseQuadTree::search",
-                collect(id, |cb| self.grid_loose.search(bounds, cb)),
-            ),
-            (
-                "GridLooseQuadTree::search_up",
-                collect(id, |cb| self.grid_loose.search_up(bounds, cb)),
-            ),
-            (
-                "GridLooseQuadTree::search_bidirectional",
-                collect(id, |cb| self.grid_loose.search_bidirectional(bounds, cb)),
-            ),
-            (
-                "UpSearchQuadTree",
-                collect(id, |cb| self.up_search.search(bounds, cb)),
-            ),
-            (
-                "UpSearchQuadTreeOriginal",
-                collect(id, |cb| self.original.search(bounds, cb)),
+                "HierarchicalLooseGrid",
+                collect(id, |cb| self.hierarchical_loose.search(bounds, cb)),
             ),
             (
                 "UniformGrid",
                 collect(id, |cb| self.uniform.search(bounds, cb)),
             ),
             (
-                "MultiLayerGrid",
-                collect(id, |cb| self.multi_layer.search(bounds, cb)),
+                "HierarchicalGrid",
+                collect(id, |cb| self.hierarchical.search(bounds, cb)),
+            ),
+            (
+                "OverflowBoundGrid",
+                collect(id, |cb| self.overflow_bound.search(bounds, cb)),
+            ),
+            (
+                "LazyOverflowBoundGrid",
+                collect(id, |cb| self.lazy.search(bounds, cb)),
+            ),
+            (
+                "BoxedOverflowBoundGrid",
+                collect(id, |cb| self.boxed.search(bounds, cb)),
+            ),
+            (
+                "StripedOverflowBoundGrid",
+                collect(id, |cb| self.striped.search(bounds, cb)),
+            ),
+            (
+                "IncomingOverflowBoundGrid",
+                collect(id, |cb| self.incoming.search(bounds, cb)),
             ),
         ]
     }
@@ -169,7 +197,8 @@ fn collect(id: usize, search: impl Fn(&mut dyn FnMut(usize))) -> HashSet<usize> 
     found
 }
 
-/// Every search method must agree with a brute-force scan over the live balls.
+/// Every structure's search must agree with a brute-force scan of the live
+/// balls.
 fn assert_searches_match_brute_force(trees: &Trees, balls: &[Option<(Ball, Handles)>]) {
     let live: Vec<(usize, Rectangle)> = balls
         .iter()
@@ -215,15 +244,16 @@ fn single_check() {
     assert_searches_match_brute_force(&trees, &balls);
 }
 
-/// Moving, resizing, removing and re-inserting balls through their handles
-/// must leave every tree answering searches exactly like a brute-force scan.
+/// After moves, resizes, removals and reinsertions through handles, every
+/// structure must answer searches exactly like a brute-force scan.
 #[test]
 fn check_updates_and_removals() {
     let mut rng = StdRng::seed_from_u64(7);
     let world = world();
     let mut trees = Trees::new(&world);
 
-    // `None` is a removed ball; the trees may hand its slot to a later insert.
+    // `None` marks a removed ball; the structures may reuse its slot for a
+    // later insert.
     let mut balls: Vec<Option<(Ball, Handles)>> = Vec::new();
     for _ in 0..BALL_COUNT {
         let ball = random_ball(&mut rng, &world);
@@ -231,8 +261,8 @@ fn check_updates_and_removals() {
         balls.push(Some((ball, handles)));
     }
 
-    for _ in 0..STEPS {
-        // Move every ball; resizing some of them changes their level or node.
+    for step in 0..STEPS {
+        // Move every ball; resizing some changes their level or node.
         for (ball, handles) in balls.iter_mut().flatten() {
             ball.update(&world);
             if rng.gen_bool(0.05) {
@@ -241,7 +271,7 @@ fn check_updates_and_removals() {
             trees.update(&ball.get_bounds(), *handles);
         }
 
-        // Remove some balls and add new ones, which take over the freed slots.
+        // Remove some balls and insert new ones, which reuse the freed slots.
         for _ in 0..BALL_COUNT / 20 {
             let id = rng.gen_range(0..balls.len());
             if let Some((_, handles)) = balls[id].take() {
@@ -254,6 +284,348 @@ fn check_updates_and_removals() {
             balls.push(Some((ball, handles)));
         }
 
+        // Check the lazy bounds both stale and right after a refresh.
+        if step % 2 == 1 {
+            trees.refresh();
+        }
         assert_searches_match_brute_force(&trees, &balls);
     }
+}
+
+/// Structures whose search narrows the fixed reach of each level to a bound on
+/// how far that level's items extend beyond their cells, or skips cells by the
+/// bounding box of their items.
+trait OverflowBounded {
+    fn create(world: Rectangle, fit: bool) -> Self;
+    fn root(&self) -> Rectangle;
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle;
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle);
+    fn remove_item(&mut self, handle: ItemHandle);
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize));
+    fn refresh(&mut self) {}
+}
+
+impl OverflowBounded for OverflowBoundGrid<usize, MAX_LEVEL> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.get_bounds().clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.search(bounds, callback);
+    }
+}
+
+impl OverflowBounded for LazyOverflowBoundGrid<usize, MAX_LEVEL> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.get_bounds().clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl OverflowBounded for BoxedOverflowBoundGrid<usize, MAX_LEVEL> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.get_bounds().clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+
+impl OverflowBounded for StripedOverflowBoundGrid<usize, MAX_LEVEL> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.get_bounds().clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl OverflowBounded for IncomingOverflowBoundGrid<usize, MAX_LEVEL> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.get_bounds().clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+/// Worlds with square and non-square roots, and with an offset origin.
+const TIGHT_WORLDS: [Rectangle; 3] = [
+    Rectangle::new(-128.0, -128.0, 896.0, 384.0),
+    Rectangle::new(0.0, 0.0, 20000.0, 20000.0),
+    Rectangle::new(0.3, -0.7, 1000.1, 333.3),
+];
+
+/// Move `value` a few floats up or down, onto either side of an edge.
+fn jitter(rng: &mut StdRng, mut value: f64) -> f64 {
+    for _ in 0..rng.gen_range(0..4) {
+        value = if rng.gen_bool(0.5) {
+            value.next_up()
+        } else {
+            value.next_down()
+        };
+    }
+    value
+}
+
+/// Bounds of an item on a random level below the root. Unless `saturate`
+/// hits, the item stays well below its level's size limit, so that level's
+/// bound shrinks below the fixed reach. Centers often lie on a cell edge,
+/// where an item reaches furthest into the neighboring cell.
+fn tight_item(rng: &mut StdRng, root: &Rectangle, world: &Rectangle, saturate: f64) -> Rectangle {
+    let level = rng.gen_range(2..=MAX_LEVEL as u32);
+    let cells = 1u32 << (level - 1);
+    let node_width = root.get_width() / cells as f64;
+    let node_height = root.get_height() / cells as f64;
+    let (low, high) = if rng.gen_bool(saturate) {
+        (0.95, 1.0)
+    } else if level == MAX_LEVEL as u32 {
+        (0.02, 0.4)
+    } else {
+        // More than half a node keeps the item on this level.
+        (0.51, 0.75)
+    };
+    let width = node_width * rng.gen_range(low..high);
+    let height = node_height * rng.gen_range(low..high);
+
+    let mut coordinate = |min: f64, node: f64, range: std::ops::Range<f64>| {
+        if rng.gen_bool(0.5) {
+            let edge = min + node * rng.gen_range(1..cells) as f64;
+            jitter(rng, edge)
+        } else {
+            rng.gen_range(range)
+        }
+    };
+    let x = coordinate(root.min_x, node_width, world.min_x..world.max_x);
+    let y = coordinate(root.min_y, node_height, world.min_y..world.max_y);
+    Rectangle::center_rect(x, y, width, height)
+}
+
+/// The bounds of every live item, queries of every size, and queries that
+/// overlap one live item by a single float, where a bound that is too small
+/// would lose it.
+fn tight_queries(
+    rng: &mut StdRng,
+    root: &Rectangle,
+    live: &[(usize, Rectangle)],
+) -> Vec<Rectangle> {
+    let mut queries: Vec<Rectangle> = live.iter().map(|(_, bounds)| bounds.clone()).collect();
+    for _ in 0..300 {
+        let scale = 2f64.powf(-rng.gen_range(0.0..MAX_LEVEL as f64 + 1.0));
+        let (x, y) = root.get_random_point(rng);
+        queries.push(Rectangle::center_rect(
+            x,
+            y,
+            root.get_width() * scale * rng.gen_range(0.2..1.0),
+            root.get_height() * scale * rng.gen_range(0.2..1.0),
+        ));
+    }
+    for _ in 0..300 {
+        let (_, b) = &live[rng.gen_range(0..live.len())];
+        let width = b.get_width() * rng.gen_range(0.1..3.0);
+        let height = b.get_height() * rng.gen_range(0.1..3.0);
+        queries.push(match rng.gen_range(0..4) {
+            0 => Rectangle::new(b.max_x.next_down(), b.min_y, b.max_x + width, b.max_y),
+            1 => Rectangle::new(b.min_x - width, b.min_y, b.min_x.next_up(), b.max_y),
+            2 => Rectangle::new(b.min_x, b.max_y.next_down(), b.max_x, b.max_y + height),
+            _ => Rectangle::new(b.min_x, b.min_y - height, b.max_x, b.min_y.next_up()),
+        });
+    }
+    queries
+}
+
+fn assert_tight_search_matches_brute_force(
+    tree: &impl OverflowBounded,
+    items: &[Option<(ItemHandle, Rectangle)>],
+    rng: &mut StdRng,
+    context: &str,
+) {
+    let live: Vec<(usize, Rectangle)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(id, item)| item.as_ref().map(|(_, bounds)| (id, bounds.clone())))
+        .collect();
+    for query in tight_queries(rng, &tree.root(), &live) {
+        let expected: HashSet<usize> = live
+            .iter()
+            .filter(|(_, bounds)| bounds.intersects(&query))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut found = HashSet::new();
+        tree.search_items(&query, &mut |id| {
+            assert!(
+                found.insert(id),
+                "{context}: item {id} reported twice for {query:?}"
+            );
+        });
+        assert_eq!(found, expected, "{context}: query {query:?}");
+    }
+}
+
+fn check_tight_bounds<Tree: OverflowBounded>(name: &str) {
+    let mut rng = StdRng::seed_from_u64(11);
+    for world in TIGHT_WORLDS {
+        for fit in [false, true] {
+            for saturate in [0.0, 0.1] {
+                let context = format!("{name}, world {world:?}, fit {fit}, saturate {saturate}");
+                let mut tree = Tree::create(world.clone(), fit);
+                let root = tree.root();
+                let mut items: Vec<Option<(ItemHandle, Rectangle)>> = (0..400)
+                    .map(|id| {
+                        let bounds = tight_item(&mut rng, &root, &world, saturate);
+                        Some((tree.insert_item(bounds.clone(), id), bounds))
+                    })
+                    .collect();
+                assert_tight_search_matches_brute_force(&tree, &items, &mut rng, &context);
+
+                for round in 0..3 {
+                    // Small moves keep most items in their cells but change their overflow.
+                    for (handle, bounds) in items.iter_mut().flatten() {
+                        let (x, y) = bounds.get_center();
+                        let (width, height) = (bounds.get_width(), bounds.get_height());
+                        *bounds = Rectangle::center_rect(
+                            x + width * rng.gen_range(-0.3..0.3),
+                            y + height * rng.gen_range(-0.3..0.3),
+                            width,
+                            height,
+                        );
+                        tree.update_item(bounds.clone(), *handle);
+                    }
+                    // Move some items to random levels; remove some and insert new ones.
+                    for _ in 0..60 {
+                        let id = rng.gen_range(0..items.len());
+                        if let Some((handle, bounds)) = &mut items[id] {
+                            *bounds = tight_item(&mut rng, &root, &world, saturate);
+                            tree.update_item(bounds.clone(), *handle);
+                        }
+                    }
+                    for _ in 0..40 {
+                        let id = rng.gen_range(0..items.len());
+                        if let Some((handle, _)) = items[id].take() {
+                            tree.remove_item(handle);
+                        }
+                    }
+                    for _ in 0..30 {
+                        let bounds = tight_item(&mut rng, &root, &world, saturate);
+                        let handle = tree.insert_item(bounds.clone(), items.len());
+                        items.push(Some((handle, bounds)));
+                    }
+
+                    let context = format!("{context}, round {round}");
+                    assert_tight_search_matches_brute_force(&tree, &items, &mut rng, &context);
+                    tree.refresh();
+                    assert_tight_search_matches_brute_force(&tree, &items, &mut rng, &context);
+                }
+            }
+        }
+    }
+}
+
+/// Searches that use bounds below the fixed reach, or cell boxes, must still
+/// find every item, including items that overlap a query by a single float.
+#[test]
+fn check_tight_overflow_bounds() {
+    check_tight_bounds::<OverflowBoundGrid<usize, MAX_LEVEL>>("OverflowBoundGrid");
+    check_tight_bounds::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
+    check_tight_bounds::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>("BoxedOverflowBoundGrid");
+    check_tight_bounds::<StripedOverflowBoundGrid<usize, MAX_LEVEL>>(
+        "StripedOverflowBoundGrid",
+    );
+    check_tight_bounds::<IncomingOverflowBoundGrid<usize, MAX_LEVEL>>(
+        "IncomingOverflowBoundGrid",
+    );
 }

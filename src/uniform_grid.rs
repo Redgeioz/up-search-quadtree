@@ -1,9 +1,10 @@
 //! Single-level grid: every object is registered in each cell its bounds overlap.
 //!
 //! Objects are stored once, in a table indexed by the slot index of their
-//! handle; cells hold 8-byte references to that table. Moving an object within
-//! the cells it already covers is therefore a single write, and moving it to
-//! other cells scans only the cells it leaves.
+//! handle; cells hold 8-byte references into that table. An update that keeps
+//! the object's cell range is therefore a single write; one that changes it
+//! removes the reference from every cell of the old range, scanning each, and
+//! appends one to every cell of the new range.
 
 use crate::handle::{ItemHandle, Slots};
 use crate::rect::Rectangle;
@@ -28,8 +29,8 @@ struct Membership {
     /// Index into `UniformGrid::objects`.
     object: u32,
     /// First cell of the object's range. A search reports the object only
-    /// from the first cell that it and the query have in common, which
-    /// deduplicates without touching the object.
+    /// from the first cell it shares with the query, which deduplicates
+    /// without reading the object.
     first_x: u16,
     first_y: u16,
 }
@@ -39,11 +40,11 @@ pub struct UniformGrid<T: Copy> {
     origin_y: f64,
     cell_size: f64,
     /// Multiplying by the reciprocal is cheaper than dividing and, being
-    /// monotone, keeps object and query ranges consistent with each other.
+    /// monotone, keeps object and query ranges mutually consistent.
     inverse_cell_size: f64,
     cols: usize,
     rows: usize,
-    /// Row-major cells.
+    /// Cells in row-major order.
     cells: Vec<Vec<Membership>>,
     /// Indexed by the slot index of the handle. The object of a removed
     /// handle stays behind, unreferenced, until its slot is reused.
@@ -83,7 +84,7 @@ impl<T: Copy> UniformGrid<T> {
         self.cell_size
     }
 
-    /// Cell containing a point. Casting saturates, so coordinates before the
+    /// Cell containing a point. The cast saturates, so coordinates below the
     /// origin land in cell zero; `min` clamps the far side.
     #[inline]
     fn cell_of(&self, x: f64, y: f64) -> (u32, u32) {
@@ -179,8 +180,8 @@ impl<T: Copy> UniformGrid<T> {
             let cells = &self.cells[row + range.min_x as usize..=row + range.max_x as usize];
             for (x, cell) in (range.min_x..).zip(cells) {
                 for membership in cell {
-                    // An object shared by several scanned cells is reported from
-                    // the first cell that it and the query have in common.
+                    // An object in several scanned cells is reported only from
+                    // the first cell it shares with the query.
                     let is_first_common_cell = (membership.first_x as u32).max(range.min_x) == x
                         && (membership.first_y as u32).max(range.min_y) == y;
                     if is_first_common_cell {

@@ -3,7 +3,7 @@ use crate::rect::Rectangle;
 
 use std::ptr;
 
-/// Where the entry of each live handle is stored.
+/// Location of the entry of each live handle.
 type NodeSlots<T, const MAX_LEVEL: u8, const MAX_ITEMS: usize> =
     Slots<NodeLocation<LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>>>;
 
@@ -64,13 +64,13 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
         }
     }
 
-    /// Return the real bounds of the root.
+    /// Return the bounds of the root without looseness.
     pub fn get_bounds(&self) -> &Rectangle {
         &self.root_bounds
     }
 
-    /// Insert an item into the LooseQuadTree and return the handle that
-    /// identifies it for [`update`](Self::update) and [`remove`](Self::remove).
+    /// Insert an item into the tree and return the handle that identifies it
+    /// for [`update`](Self::update) and [`remove`](Self::remove).
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         // `add` records the location once the entry has reached its node.
         let handle = self.slots.allocate(NodeLocation::detached());
@@ -87,7 +87,7 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
         handle
     }
 
-    /// Remove an item from the LooseQuadTree.
+    /// Remove an item from the tree.
     ///
     /// Panics if the handle has already been removed.
     pub fn remove(&mut self, handle: ItemHandle) {
@@ -101,7 +101,7 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
         LooseQuadTree::merge(node);
     }
 
-    /// Update the bounds of an item and, if necessary, its position in the LooseQuadTree.
+    /// Update the bounds of an item and, if necessary, its node.
     ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
@@ -117,12 +117,13 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
                 let height = bounds.get_height();
 
                 let new_node = if !self.world_bounds.contains_point((x, y)) {
-                    // Mirror `insert`: an item whose center left the world belongs to the root.
+                    // As in `insert`, an item centered outside the world belongs
+                    // to the root.
                     &mut *self.root as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>
                 } else {
-                    // Climb while `insert` would not have descended this far: a node
-                    // only holds items that fit half its loose bounds and whose center
-                    // lies in its own (unloosened) area.
+                    // Climb while `insert` would not descend this far: a node holds
+                    // only items that fit half its loose bounds and are centered in
+                    // its unloosened area.
                     let mut new_node = &mut *old_node;
                     while new_node.level != 1
                         && (width > new_node.loose_bounds.get_width() / 2.0
@@ -132,7 +133,7 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
                         new_node = &mut *new_node.parent;
                     }
 
-                    // Then descend exactly like `insert` does.
+                    // Then descend exactly as `insert` does.
                     let mut new_node = new_node as *mut LooseQuadTreeNode<T, MAX_LEVEL, MAX_ITEMS>;
                     while let Some(children) = (*new_node).children.as_mut() {
                         if width > (*new_node).loose_bounds.get_width() / 4.0
@@ -192,7 +193,8 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
         }
     }
 
-    /// Search in the LooseQuadTree by the given area. Execute the callback function for each item found.
+    /// Search for items whose bounds intersect `bounds`, calling `callback`
+    /// for each.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
         self.root.search(bounds, &mut callback);
     }
@@ -227,7 +229,7 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         LooseQuadTreeNode::new(self.level + 1, rect, self as *mut Self)
     }
 
-    /// Store `entry` in this node and record where it went.
+    /// Store `entry` in this node and record its location.
     fn add(&mut self, entry: Entry<T>, slots: &mut NodeSlots<T, MAX_LEVEL, MAX_ITEMS>) {
         *slots.get_mut(entry.handle) = NodeLocation {
             node: self,
@@ -237,8 +239,8 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         self.split(slots);
     }
 
-    /// Take the entry at `index` out of this node. The entry that fills the
-    /// gap has its slot updated, so handles stay valid without any lookup.
+    /// Take the entry at `index` out of this node. The entry moved into the
+    /// gap has its slot updated, so its handle stays valid without a lookup.
     fn take_entry(
         &mut self,
         index: usize,
@@ -305,8 +307,7 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
             }
         }
 
-        // The item is not contained in any child.
-        // So insert it into self here.
+        // No child fits the item, or the node has none: store it here.
         self.add(entry, slots);
     }
 

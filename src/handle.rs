@@ -1,17 +1,17 @@
 //! Handles that identify stored items without hashing them.
 //!
-//! Every tree hands out an [`ItemHandle`] on insertion and takes it back on
-//! `update` and `remove`. The handle indexes a [`Slots`] table that records
-//! where the item is stored, so neither operation hashes the item or scans a
-//! node for it, and the item type needs no `Eq` or `Hash` implementation.
+//! Every structure returns an [`ItemHandle`] from `insert` and accepts it in
+//! `update` and `remove`. The handle indexes a [`Slots`] table recording where
+//! the item is stored, so neither operation hashes the item or scans a node
+//! for it, and the item type needs no `Eq` or `Hash` implementation.
 
 use crate::rect::Rectangle;
 use std::ptr;
 
 /// Identifies an inserted item for `update` and `remove`.
 ///
-/// Slots are reused after removal; the generation tells a handle whose item
-/// has been removed apart from the handle of the item that took its slot.
+/// Slots are reused after removal; the generation distinguishes a handle whose
+/// item was removed from the handle of the item that reused its slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ItemHandle {
     index: u32,
@@ -26,8 +26,8 @@ impl ItemHandle {
     }
 }
 
-/// One stored item. `bounds` comes first so that intersection tests read the
-/// front of the entry; `handle` is only needed when entries move.
+/// One stored item. `bounds` comes first, so intersection tests read the
+/// front of the entry; `handle` is needed only when entries move.
 #[repr(C)]
 pub(crate) struct Entry<T> {
     pub(crate) bounds: Rectangle,
@@ -35,18 +35,18 @@ pub(crate) struct Entry<T> {
     pub(crate) handle: ItemHandle,
 }
 
-/// Where an entry is stored in a tree whose levels are grids of nodes.
+/// Location of an entry in a structure whose levels are grids of nodes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GridLocation {
     pub(crate) level: u32,
     pub(crate) x: u32,
     pub(crate) y: u32,
-    /// Position of the entry in the node.
+    /// Index of the entry within its node.
     pub(crate) index: u32,
 }
 
-// `GridLocation` is not generic but runs inside the generic tree methods, which
-// other crates instantiate; `#[inline]` keeps it inlinable there.
+// These methods are not generic but run inside generic tree methods, which
+// other crates instantiate; `#[inline]` keeps them inlinable there.
 impl GridLocation {
     #[inline]
     pub(crate) fn new((level, x, y): (usize, usize, usize), index: usize) -> Self {
@@ -65,10 +65,10 @@ impl GridLocation {
     }
 }
 
-/// Where an entry is stored in a tree of pointer-linked nodes.
+/// Location of an entry in a tree of pointer-linked nodes.
 pub(crate) struct NodeLocation<N> {
     pub(crate) node: *mut N,
-    /// Position of the entry in the node.
+    /// Index of the entry within its node.
     pub(crate) index: u32,
 }
 
@@ -82,7 +82,7 @@ impl<N> NodeLocation<N> {
     }
 }
 
-// Derived impls would needlessly require `N: Clone`.
+// Derived impls would needlessly require `N: Clone` and `N: Copy`.
 impl<N> Clone for NodeLocation<N> {
     fn clone(&self) -> Self {
         *self
@@ -90,15 +90,15 @@ impl<N> Clone for NodeLocation<N> {
 }
 impl<N> Copy for NodeLocation<N> {}
 
-/// Table of where the item of every live handle is stored.
+/// Table of the location of every live handle's item.
 pub(crate) struct Slots<L> {
     slots: Vec<Slot<L>>,
-    /// Slots released by `free`, reused by the next `allocate`.
+    /// Slots released by `free`, reused by subsequent `allocate` calls.
     free: Vec<u32>,
 }
 
-/// A freed slot already carries the generation that the next `allocate`
-/// hands out, so every handle issued before the release stops matching.
+/// A freed slot already holds the generation that its next `allocate` hands
+/// out, so every handle issued before the release stops matching.
 struct Slot<L> {
     generation: u32,
     location: L,
@@ -124,8 +124,8 @@ impl<L: Copy> Slots<L> {
         self.slots.len()
     }
 
-    /// Hand out a handle whose slot records `location`, reusing a freed slot
-    /// if there is one.
+    /// Return a handle whose slot records `location`, reusing a freed slot if
+    /// one exists.
     #[inline]
     pub(crate) fn allocate(&mut self, location: L) -> ItemHandle {
         if let Some(index) = self.free.pop() {
@@ -161,8 +161,8 @@ impl<L: Copy> Slots<L> {
         slot.location
     }
 
-    /// Location of a handle the caller knows to be live, for example the
-    /// handle of an entry that was just read from a node.
+    /// Location of a handle known to be live, e.g. that of an entry just read
+    /// from a node. Liveness is checked only in debug builds.
     #[inline]
     pub(crate) fn get_mut(&mut self, handle: ItemHandle) -> &mut L {
         let slot = &mut self.slots[handle.index as usize];
@@ -173,8 +173,8 @@ impl<L: Copy> Slots<L> {
         &mut slot.location
     }
 
-    /// Release the slot of a live handle. The handle, and every copy of it,
-    /// is rejected from now on.
+    /// Release the slot of a live handle. The handle and all its copies are
+    /// rejected from then on.
     #[inline]
     pub(crate) fn free(&mut self, handle: ItemHandle) {
         let slot = &mut self.slots[handle.index as usize];

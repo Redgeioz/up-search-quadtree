@@ -18,7 +18,7 @@ const MAX_RADIUS: f64 = 4.0;
 const MIN_VELOCITY: f64 = 0.2;
 const MAX_VELOCITY: f64 = 1.0;
 
-type QTree = UpSearchQuadTree<usize, MAX_LEVEL>;
+type QTree = HierarchicalLooseGrid<usize, MAX_LEVEL>;
 
 #[derive(Resource)]
 struct Data {

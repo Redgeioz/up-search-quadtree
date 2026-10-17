@@ -1,5 +1,4 @@
-/target
-/example/target
+**/target
 .history
 .vscode
 Cargo.lock

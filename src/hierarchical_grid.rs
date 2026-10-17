@@ -1,29 +1,29 @@
-//! Multi-layer loose grid.
+//! Hierarchical grid: one loose grid per level, scanned without the ancestor walk.
 //!
 //! Level `L` has `2^(L - 1)` cells per axis over a square region covering the
-//! world. An object lives on the level whose cells fit it, in the cell
-//! containing its center, exactly like `UpSearchQuadTree::position`. The
-//! difference is the search: every level is scanned over the cell range of the
-//! query padded by half a cell, without the quadtree's upward 3x3 walk. The
-//! range is converted to integer half-cell coordinates once on the finest
-//! level and derived for coarser levels by shifting; cells whose loose
-//! envelope lies inside the query emit their objects without a test.
+//! world. An object is stored on the level whose cells fit it, in the cell
+//! containing its center, exactly as in `HierarchicalLooseGrid::position`.
+//! Only the search differs: every level is scanned over the query's cell range
+//! padded by half a cell, without the 3x3 ancestor walk. The query is
+//! converted to integer half-cell coordinates once, on the finest level, and
+//! shifted for coarser levels; cells whose loose envelope lies inside the
+//! query report their objects without intersection tests.
 
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::layer_geometry::LayerGeometry;
 use crate::rect::Rectangle;
 
-/// (level, x, y)
+/// `(level, x, y)`
 type Coord = (usize, usize, usize);
 
-/// Cells of one level in row-major order. The size limits and cell edges of
-/// the level live in `MultiLayerGrid::geometry`.
+/// Cells of one level, in row-major order. The level's size limits and cell
+/// edges are stored in `HierarchicalGrid::geometry`.
 struct Layer<T> {
     cells_per_axis: usize,
-    /// Reciprocal of the cell size. Positioning multiplies by it instead of
-    /// dividing, which is cheaper; the cell edges of the geometry are built
-    /// with the same arithmetic, and the search derives its coordinates from
-    /// the finest level's reciprocal by exact power-of-two scaling.
+    /// Reciprocal of the cell size. Positioning multiplies by it, which is
+    /// cheaper than dividing; the geometry builds its cell edges with the same
+    /// arithmetic, and the search derives its coordinates from the finest
+    /// level's reciprocal by exact power-of-two scaling.
     inverse_cell_size: f64,
     cells: Vec<Vec<Entry<T>>>,
 }
@@ -35,9 +35,9 @@ impl<T> Layer<T> {
     }
 }
 
-pub struct MultiLayerGrid<T: Copy, const MAX_LEVEL: u8> {
+pub struct HierarchicalGrid<T: Copy, const MAX_LEVEL: u8> {
     world_bounds: Rectangle,
-    /// Origin of the square region covering the world, whose side is `side`.
+    /// Origin of the square region of side `side` that covers the world.
     origin_x: f64,
     origin_y: f64,
     side: f64,
@@ -45,11 +45,11 @@ pub struct MultiLayerGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Vec<Layer<T>>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
-    /// Where the entry of each live handle is stored.
+    /// Location of the entry of each live handle.
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> HierarchicalGrid<T, MAX_LEVEL> {
     pub fn new(world_bounds: Rectangle) -> Self {
         assert!(MAX_LEVEL > 0, "`MAX_LEVEL` cannot be zero.");
         let finest = 1usize << (MAX_LEVEL - 1);
@@ -60,9 +60,9 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
 
         let side = world_bounds.get_width().max(world_bounds.get_height());
         let (origin_x, origin_y) = world_bounds.get_min();
-        // The geometry only needs the size of the region. Taking it from a
-        // rectangle at the origin keeps both sides exactly `side`, which the
-        // world's own corners may not subtract back to.
+        // The geometry needs only the size of the region. A rectangle at the
+        // origin keeps both sides exactly `side`; the world's own corners may
+        // not subtract back to it.
         let region = Rectangle::new(0.0, 0.0, side, side);
 
         let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
@@ -106,8 +106,8 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
         }
     }
 
-    /// Level and cell where an object with these bounds is stored. Objects
-    /// whose center lies outside the world go to the single cell of level 1.
+    /// Level and cell that store an object with these bounds. Objects centered
+    /// outside the world go to the single cell of level 1.
     fn position(&self, bounds: &Rectangle) -> Coord {
         let center = bounds.get_center();
         if !self.world_bounds.contains_point(center) {
@@ -118,9 +118,10 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
         (level, x, y)
     }
 
-    /// Level whose cells fit an object of this size: it must fit across the
-    /// region at least `2^(level - 1)` times, as in `UpSearchQuadTree`. The
-    /// region and its cells are square, so the longer side decides alone.
+    /// Level whose cells fit an object of this size: the finest level `L` such
+    /// that the object fits across the region at least `2^(L - 1)` times,
+    /// clamped to `1..=MAX_LEVEL`, as in `HierarchicalLooseGrid`. The region
+    /// and its cells are square, so the longer side alone decides.
     fn level_for_size(&self, width: f64, height: f64) -> usize {
         let multiple = (self.side / width.max(height)) as usize;
         let level = usize::BITS - multiple.leading_zeros();
@@ -184,8 +185,8 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
         self.geometry[level].object_count -= 1;
     }
 
-    /// Take an entry out of its cell. The entry that fills the gap has its
-    /// slot updated, so handles stay valid without any lookup.
+    /// Take an entry out of its cell. The entry moved into the gap has its
+    /// slot updated, so its handle stays valid without a lookup.
     fn take_entry(&mut self, level: usize, x: usize, y: usize, index: usize) -> Entry<T> {
         let cell = self.layers[level].cell_mut(x, y);
         let entry = cell.swap_remove(index);
@@ -195,9 +196,10 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
         entry
     }
 
-    /// Cheap check that `position` would still return `coord` for `bounds`,
-    /// using the cached size limits and cell edges of the level. Returns false
-    /// on levels without the shortcut; the caller then falls back to `position`.
+    /// Check cheaply whether `position` would still return `coord` for
+    /// `bounds`, using the level's cached size limits and cell edges. Returns
+    /// false on levels without the shortcut, where the caller falls back to
+    /// `position`.
     fn stays_in_cell(&self, bounds: &Rectangle, coord: Coord) -> bool {
         let (level, x, y) = coord;
         let geometry = &self.geometry[level];
@@ -216,10 +218,11 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
     /// Call `callback` for every item whose bounds intersect `bounds`,
     /// finest level first.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
-        // Half-cell coordinates of the query on the finest level. Every coarser
-        // level's cells are unions of finest cells with the same origin, so its
-        // half-cell coordinates follow by an arithmetic shift. `floor` keeps
-        // negative coordinates exact; the query may reach outside the world.
+        // Half-cell coordinates of the query on the finest level. The cells of
+        // every coarser level are unions of finest cells with the same origin,
+        // so their half-cell coordinates follow by an arithmetic shift. `floor`
+        // keeps negative coordinates exact, as the query may extend outside
+        // the world.
         let inverse_half_cell = self.layers[MAX_LEVEL as usize].inverse_cell_size * 2.0;
         let half = [
             ((bounds.min_x - self.origin_x) * inverse_half_cell).floor() as i64,
@@ -239,15 +242,15 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
             let last = layer.cells_per_axis as i64 - 1;
 
             // Objects on this level are at most one cell large and centered in
-            // their cell, so they reach at most half a cell beyond it: pad the
-            // query by one half-cell on each side.
+            // their cell, so they extend at most half a cell (the fixed reach)
+            // beyond it: pad the query by one half-cell on each side.
             let first_cx = (min_x.saturating_sub(1) >> 1).clamp(0, last) as usize;
             let first_cy = (min_y.saturating_sub(1) >> 1).clamp(0, last) as usize;
             let last_cx = (max_x.saturating_add(1) >> 1).clamp(0, last) as usize;
             let last_cy = (max_y.saturating_add(1) >> 1).clamp(0, last) as usize;
 
             // A cell whose loose envelope `[c - 0.5, c + 1.5]` (in cells) lies
-            // inside the query can emit its objects without testing them. The
+            // inside the query reports its objects without testing them. The
             // thresholds are conservative by up to one cell on the far side.
             let inner_min_x = min_x.saturating_add(1) >> 1;
             let inner_min_y = min_y.saturating_add(1) >> 1;
@@ -274,9 +277,8 @@ impl<T: Copy, const MAX_LEVEL: u8> MultiLayerGrid<T, MAX_LEVEL> {
             }
         }
 
-        // The root cell also holds objects centered outside the world and
-        // objects larger than the world, so nothing about their extent can be
-        // assumed: always test them.
+        // The root cell also holds objects centered outside the world or
+        // larger than it, whose extent is unbounded: always test them.
         if !self.geometry[1].is_empty() {
             for entry in &self.layers[1].cells[0] {
                 if entry.bounds.intersects(bounds) {
@@ -294,7 +296,7 @@ mod tests {
     use std::ops::Range;
 
     const MAX_LEVEL: u8 = 7;
-    type Grid = MultiLayerGrid<usize, MAX_LEVEL>;
+    type Grid = HierarchicalGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
@@ -309,7 +311,7 @@ mod tests {
             .collect()
     }
 
-    /// Move `value` a few floats up or down so it lands on either side of a boundary.
+    /// Move `value` a few floats up or down, onto either side of a boundary.
     fn jitter(rng: &mut StdRng, mut value: f64) -> f64 {
         for _ in 0..rng.gen_range(0..4) {
             value = if rng.gen_bool(0.5) {
@@ -321,7 +323,7 @@ mod tests {
         value
     }
 
-    /// Jitter around one of `candidates`, or fall back to a uniform value.
+    /// Jitter one of `candidates`, or draw a uniform value from `fallback`.
     fn near_one_of(rng: &mut StdRng, candidates: &[f64], fallback: Range<f64>) -> f64 {
         if candidates.is_empty() || rng.gen_bool(0.3) {
             rng.gen_range(fallback)
@@ -332,12 +334,12 @@ mod tests {
     }
 
     /// Random bounds biased towards the size limits and cell edges of a random
-    /// level, where `position` and the cached geometry are most likely to disagree.
+    /// level, where `position` and the cached geometry most likely disagree.
     fn random_bounds(rng: &mut StdRng, grid: &Grid) -> Rectangle {
         let world = &grid.world_bounds;
         let geometry = &grid.geometry[rng.gen_range(1..=MAX_LEVEL as usize)];
 
-        // The cell size is the size limit of the level, half of it that of the
+        // The cell size is the level's size limit; half of it is that of the
         // next finer level.
         let size_limits = if geometry.has_update_shortcut() {
             vec![geometry.node_width, geometry.half_node_width]
@@ -366,10 +368,10 @@ mod tests {
         Rectangle::center_rect(center_x, center_y, width, height)
     }
 
-    /// The update shortcut must agree with `position` exactly, although the
-    /// cell edges are built from the reciprocal arithmetic of this grid. A
-    /// false positive would leave an item in the wrong cell; a false negative
-    /// would only cost time, but the cached limits claim to be exact.
+    /// The update shortcut must agree exactly with `position`, although the
+    /// cell edges follow this grid's reciprocal arithmetic. A false positive
+    /// would leave an item in the wrong cell; a false negative would only cost
+    /// time, but the cached limits are meant to be exact.
     #[test]
     fn update_shortcut_agrees_with_position() {
         let mut rng = StdRng::seed_from_u64(0);
@@ -387,7 +389,7 @@ mod tests {
                     );
                 }
 
-                // Neighbouring cells on the same level must be rejected.
+                // Neighboring cells on the same level must be rejected.
                 let cells_per_axis = grid.layers[level].cells_per_axis;
                 for dy in -1..=1isize {
                     for dx in -1..=1isize {
@@ -416,8 +418,8 @@ mod tests {
     }
 
     /// The search derives every level's cell range from the finest level's
-    /// half-cell coordinates by shifting. That must land in the same cell as
-    /// `position` does for a point at that coordinate, including at the edges.
+    /// half-cell coordinates by shifting. For any point, the shift must yield
+    /// the cell that `position` assigns, including at cell edges.
     #[test]
     fn shifted_half_cells_agree_with_position() {
         let mut rng = StdRng::seed_from_u64(2);
@@ -445,9 +447,9 @@ mod tests {
         }
     }
 
-    /// Moving and resizing items through `update` must keep every slot and
-    /// per-level object count consistent with `position`, also after removals
-    /// and the slot reuse that follows them.
+    /// Moves and resizes through `update` must keep every slot and per-level
+    /// object count consistent with `position`, also after removals and the
+    /// subsequent slot reuse.
     #[test]
     fn update_keeps_slots_and_counts_consistent() {
         let mut rng = StdRng::seed_from_u64(1);
@@ -488,7 +490,7 @@ mod tests {
             bounds_of.truncate(250);
             assert_consistent(&grid, &handles, &bounds_of);
 
-            // New items take over the freed slots.
+            // New items reuse the freed slots.
             for item in 250..400 {
                 let bounds = random_bounds(&mut rng, &grid);
                 handles.push(grid.insert(bounds.clone(), item));

@@ -5,41 +5,42 @@ use grid::*;
 
 /// (level, x, y)
 type Coord = (usize, usize, usize);
-type Layers<T> = Vec<Grid<UpSearchQuadTreeNode<T>>>;
+type Layers<T> = Vec<Grid<HierarchicalLooseGridNode<T>>>;
 
-/// Optimized [`GridLooseQuadTree`] retaining only the up-search function.
+/// Hierarchical loose grid with looseness 2: one grid per level, nested like
+/// the levels of a quadtree and searched from the bottom up.
 ///
-/// The main change is to store only the items on each node to reduce the size of each node.
-/// As the up-search method does not rely on intersection check of nodes, there is no need to
-/// store the bounds of each node.
-///
-/// [`GridLooseQuadTree`]: crate::grid_loose_quadtree::GridLooseQuadTree
-pub struct UpSearchQuadTree<T: Copy, const MAX_LEVEL: u8> {
+/// An item's level follows from its size and its node from its center, both
+/// in O(1), so insertion needs no descent through the levels. Search reaches
+/// nodes through grid coordinates instead of testing their bounds, so a node
+/// stores only its items.
+pub struct HierarchicalLooseGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
-    /// Where the entry of each live handle is stored.
+    /// Location of the entry of each live handle.
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
-    /// Create a new quadtree with the given bounds.
+impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
+    /// Create a new grid with the given bounds.
     ///
-    /// Force using a square as the bounds of each node. This usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
+    /// Every node is square, which usually makes searches more efficient.
+    pub fn new(world_bounds: Rectangle) -> HierarchicalLooseGrid<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
-    /// Create a new quadtree with the given bounds.
+    /// Create a new grid with the given bounds.
     ///
-    /// Make the bounds of each node fit the given bounds instead of forcing it to be square.
-    pub fn new_fit(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
+    /// Nodes divide the given bounds evenly along each axis instead of being
+    /// square.
+    pub fn new_fit(world_bounds: Rectangle) -> HierarchicalLooseGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(world_bounds: Rectangle) -> UpSearchQuadTree<T, MAX_LEVEL> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> HierarchicalLooseGrid<T, MAX_LEVEL> {
         let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
         assert!(
@@ -50,7 +51,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         let world_width = world_bounds.get_width();
         let world_height = world_bounds.get_height();
 
-        // Initialize layers
+        // One grid per level; level zero has no cells.
         let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
         let mut size = 0;
         for n in 0..=MAX_LEVEL {
@@ -65,14 +66,14 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             let mut vec = Vec::with_capacity(rows * cols);
             for _ in 0..rows {
                 for _ in 0..cols {
-                    vec.push(UpSearchQuadTreeNode::new());
+                    vec.push(HierarchicalLooseGridNode::new());
                 }
             }
             layers.push(Grid::from_vec(vec, cols));
             size = 1 << n;
         }
 
-        // Determine the root bounds to use
+        // Root bounds: unless fitted, a square from the world's minimum corner.
         let root_bounds = if !FIT {
             let len = world_width.max(world_height);
             let root_width = len;
@@ -97,7 +98,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             ));
         }
 
-        UpSearchQuadTree {
+        HierarchicalLooseGrid {
             layers,
             geometry,
             root_bounds,
@@ -111,7 +112,8 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         &self.root_bounds
     }
 
-    /// Find the level and coordinates of the node where the item should be inserted.
+    /// Find the level and coordinates of the node that holds an item with
+    /// these bounds.
     pub fn position(&self, bounds: &Rectangle) -> Coord {
         let center = bounds.get_center();
         if !self.world_bounds.contains_point(center) {
@@ -126,13 +128,13 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     /// Level whose nodes fit an object of the given size.
     ///
     /// Level `L` holds objects that fit across the root at least `2^(L - 1)`
-    /// times but fewer than `2^L` times, clamped to `1..=MAX_LEVEL`.
-    /// [`LayerGeometry`] caches the matching size limits of each level.
+    /// but fewer than `2^L` times along the tighter axis, clamped to
+    /// `1..=MAX_LEVEL`. [`LayerGeometry`] caches the matching size limits.
     fn level_for_size(&self, width: f64, height: f64) -> usize {
         let multiple_x = (self.root_bounds.get_width() / width) as usize;
         let multiple_y = (self.root_bounds.get_height() / height) as usize;
 
-        // Equals to:
+        // Equivalent to:
         // let multiple = multiple_x.min(multiple_y);
         // let level = if multiple != 0 {
         //     ((multiple.ilog2() + 1) as u8).min(MAX_LEVEL)
@@ -153,15 +155,15 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         (x, y)
     }
 
-    fn get_root(&self) -> &UpSearchQuadTreeNode<T> {
+    fn get_root(&self) -> &HierarchicalLooseGridNode<T> {
         unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
-    /// Insert an item into the quadtree and return the handle that identifies
+    /// Insert an item into the grid and return the handle that identifies
     /// it for [`update`](Self::update) and [`remove`](Self::remove).
     ///
-    /// The time complexity is O(1) since the insertion position is obtained directly
-    /// by computation, instead of by judgment at each node.
+    /// O(1): the position is computed directly rather than decided node by
+    /// node.
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         let coord @ (level, x, y) = self.position(&bounds);
         let node = &mut self.layers[level][y][x];
@@ -177,7 +179,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         handle
     }
 
-    /// Remove an item from the quadtree.
+    /// Remove an item from the grid.
     ///
     /// Panics if the handle has already been removed.
     pub fn remove(&mut self, handle: ItemHandle) {
@@ -189,7 +191,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         self.geometry[level].object_count -= 1;
     }
 
-    /// Update the bounds of an item and, if necessary, its position in the quadtree.
+    /// Update the bounds of an item and, if necessary, its position in the grid.
     ///
     /// Panics if the handle has already been removed.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
@@ -217,10 +219,11 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         self.geometry[level].object_count -= 1;
     }
 
-    /// Take the entry at `index` out of a node. The entry that fills the gap
-    /// has its slot updated, so handles stay valid without any lookup.
+    /// Take the entry at `index` out of a node by swap removal. The entry that
+    /// fills the gap has its slot updated, so handles stay valid without a
+    /// lookup.
     ///
-    /// Takes plain coordinates rather than a `GridLocation`: keeping the whole
+    /// Takes plain coordinates rather than a `GridLocation`; keeping the whole
     /// location alive across `update` measured several percent slower.
     fn take_entry(&mut self, level: usize, x: usize, y: usize, index: usize) -> Entry<T> {
         let node = &mut self.layers[level][y][x];
@@ -231,12 +234,13 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
         entry
     }
 
-    /// Cheap check that `position` would still return `coord` for `bounds`.
+    /// Check cheaply whether `position` would still return `coord` for
+    /// `bounds`.
     ///
-    /// The cached limits mirror position's division, truncation and clamp
-    /// exactly, so resizing within the same level passes as well. Returns
-    /// false on levels without the shortcut; the caller then falls back to
-    /// `position`.
+    /// The cached limits reproduce the division, truncation and clamp of
+    /// `position` exactly, so a resize within the same level also passes.
+    /// Returns false on levels without the update shortcut and for degenerate
+    /// sizes; the caller then falls back to `position`.
     fn stays_in_node(&self, bounds: &Rectangle, coord: Coord) -> bool {
         let (level, x, y) = coord;
         let geometry = &self.geometry[level];
@@ -253,11 +257,18 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
-    /// Search from the bottom up. Execute the callback function for each item found.
+    /// Search from the bottom up, calling `callback` for each item found.
     ///
-    /// For details, please refer to the declaration of [`GridLooseQuadTree::search_up`]
+    /// The query's level follows from its size, as for an item. On each finer
+    /// level, the range of nodes whose items may reach the query is computed
+    /// from the query bounds and scanned, finest level first. From the query's
+    /// level up to the root, the ancestor walk checks only the 3x3 block around
+    /// the query's cell and each of its ancestors. Neither part tests node
+    /// bounds.
     ///
-    /// [`GridLooseQuadTree::search_up`]: crate::grid_loose_quadtree::GridLooseQuadTree::search_up
+    /// Since levels are visited from the finest up, smaller items tend to be
+    /// reported before larger ones; items within a level are not sorted by
+    /// size.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
         let max_level = MAX_LEVEL as usize;
         let level = self.level_for_size(bounds.get_width(), bounds.get_height());
@@ -265,18 +276,18 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
 
         let layers = &self.layers;
         if level != max_level {
-            // top left
+            // Top-left corner relative to the root origin.
             let min_x = bounds.min_x - offset_x;
             let min_y = bounds.min_y - offset_y;
 
-            // bottom right
+            // Bottom-right corner relative to the root origin.
             let max_x = bounds.max_x - offset_x;
             let max_y = bounds.max_y - offset_y;
 
             let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
             let calc_max = |n: f64| (n - 0.5).ceil() as usize;
 
-            // Note: Searching directly from the bottom to the top using this method will be slower
+            // Scanning every level this way, without the ancestor walk, is slower.
             layers[level + 1..=max_level]
                 .iter()
                 .zip(&self.geometry[level + 1..=max_level])
@@ -296,7 +307,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                     let max_coord_x = calc_max(max_x / node_width).min(grid_width - 1);
                     let max_coord_y = calc_max(max_y / node_height).min(grid_height - 1);
 
-                    // Scan the region obtained
+                    // Scan the resulting range.
                     for y in min_coord_y..=max_coord_y {
                         for x in min_coord_x..=max_coord_x {
                             let node = unsafe { grid.get_unchecked(y, x) };
@@ -309,7 +320,8 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                                 && x > min_coord_x + 1
                                 && x < max_coord_x - 1
                             {
-                                // This node is fully contained, so the intersection checks can be skipped
+                                // The node lies within the query, loose bounds
+                                // included, so its items need no intersection test.
                                 node.iter_items(&mut callback);
                             } else {
                                 node.search_items(bounds, &mut callback);
@@ -399,7 +411,7 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
                         }
                     }
                 }
-                // Advance the ancestor path even when this layer has no objects.
+                // Advance to the parent cell, also on an empty level.
                 center_x += if x & 1 == 0 { half_width } else { -half_width };
                 center_y += if y & 1 == 0 {
                     half_height
@@ -416,11 +428,11 @@ impl<T: Copy, const MAX_LEVEL: u8> UpSearchQuadTree<T, MAX_LEVEL> {
     }
 }
 
-pub struct UpSearchQuadTreeNode<T: Copy> {
+pub struct HierarchicalLooseGridNode<T: Copy> {
     items: Vec<Entry<T>>,
 }
 
-impl<T: Copy> UpSearchQuadTreeNode<T> {
+impl<T: Copy> HierarchicalLooseGridNode<T> {
     fn new() -> Self {
         Self { items: Vec::new() }
     }
@@ -437,8 +449,8 @@ impl<T: Copy> UpSearchQuadTreeNode<T> {
     }
 }
 
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for UpSearchQuadTree<T, MAX_LEVEL> {}
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for UpSearchQuadTree<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for HierarchicalLooseGrid<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for HierarchicalLooseGrid<T, MAX_LEVEL> {}
 
 #[cfg(test)]
 mod tests {
@@ -447,7 +459,7 @@ mod tests {
     use std::ops::Range;
 
     const MAX_LEVEL: u8 = 7;
-    type Tree = UpSearchQuadTree<usize, MAX_LEVEL>;
+    type Tree = HierarchicalLooseGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
@@ -462,7 +474,7 @@ mod tests {
             .collect()
     }
 
-    /// Move `value` a few floats up or down so it lands on either side of a boundary.
+    /// Move `value` a few floats up or down, onto either side of a boundary.
     fn jitter(rng: &mut StdRng, mut value: f64) -> f64 {
         for _ in 0..rng.gen_range(0..4) {
             value = if rng.gen_bool(0.5) {
@@ -485,14 +497,14 @@ mod tests {
     }
 
     /// Random bounds biased towards the size limits and cell edges of a random
-    /// level, where `position` and the cached geometry are most likely to disagree.
+    /// level, where `position` and the cached geometry most likely disagree.
     fn random_bounds(rng: &mut StdRng, tree: &Tree) -> Rectangle {
         let root = tree.get_bounds();
         let world = &tree.world_bounds;
         let geometry = &tree.geometry[rng.gen_range(1..=MAX_LEVEL as usize)];
 
-        // The node size is the size limit of the level, half of it that of the
-        // next finer level.
+        // The node size is the size limit of the level; half of it is that of
+        // the next finer level.
         let size_limits = |node_size: f64| -> Vec<f64> {
             if geometry.has_update_shortcut() {
                 vec![node_size, node_size * 0.5]
@@ -526,7 +538,7 @@ mod tests {
 
     /// The update shortcut must agree with `position` exactly. A false positive
     /// would leave an item in the wrong node; a false negative would only cost
-    /// time, but the cached limits claim to be exact.
+    /// time, but the cached limits are meant to be exact.
     #[test]
     fn update_shortcut_agrees_with_position() {
         let mut rng = StdRng::seed_from_u64(0);
@@ -544,7 +556,7 @@ mod tests {
                     );
                 }
 
-                // Neighbouring cells on the same level must be rejected.
+                // Neighboring cells on the same level must be rejected.
                 let grid = &tree.layers[level];
                 for dy in -1..=1isize {
                     for dx in -1..=1isize {
@@ -572,9 +584,9 @@ mod tests {
         }
     }
 
-    /// Moving and resizing items through `update` must keep every slot and
-    /// per-level object count consistent with `position`, also after removals
-    /// and the slot reuse that follows them.
+    /// Moves and resizes through `update` must keep every slot and per-level
+    /// object count consistent with `position`, also after removals and the
+    /// slot reuse that follows them.
     #[test]
     fn update_keeps_slots_and_counts_consistent() {
         let mut rng = StdRng::seed_from_u64(1);
@@ -591,7 +603,7 @@ mod tests {
             for _ in 0..20_000 {
                 let item = rng.gen_range(0..bounds_of.len());
                 let bounds = if rng.gen_bool(0.5) {
-                    // A small move or resize, which usually stays in the same node.
+                    // A small move or resize, usually within the same node.
                     let old = &bounds_of[item];
                     let (center_x, center_y) = old.get_center();
                     let step = finest_node_width * 0.1;

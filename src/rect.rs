@@ -2,11 +2,11 @@ use rand::Rng;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Rectangle {
-    // Top left corner
+    // Top-left corner.
     pub min_x: f64,
     pub min_y: f64,
 
-    // Bottom right corner
+    // Bottom-right corner.
     pub max_x: f64,
     pub max_y: f64,
 }

@@ -1,13 +1,14 @@
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
-use crate::layer_geometry::LayerGeometry;
+use crate::cell_order::for_each_cell_hierarchically;
+use crate::layer_geometry::{LayerGeometry, half_node_corners, scan_range, size_level};
 use crate::overflow_bound_grid::DirectionalOverflow;
-use crate::overflow_bound::cell_overflow;
+use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::Rectangle;
 use grid::*;
 
 /// `(level, x, y)` of a node.
 type Coord = (usize, usize, usize);
-type Layers<T> = Vec<Grid<StripedOverflowBoundGridNode<T>>>;
+type Layers<T> = Vec<Grid<SpanOverflowBoundGridNode<T>>>;
 
 /// Box of a node without items. Every comparison of [`Rectangle::intersects`]
 /// fails against it, so search rejects the node without a separate check.
@@ -19,7 +20,7 @@ const EMPTY: Rectangle = Rectangle::new(
 );
 
 /// [`BoxedOverflowBoundGrid`] with the bound of every level refined to its
-/// stripes: the storage, positioning and handles of [`HierarchicalLooseGrid`],
+/// columns and rows: the storage, positioning and handles of [`HierarchicalLooseGrid`],
 /// where every node keeps a box covering the bounds of its items, and every
 /// column and row of a level the span of its items along its own axis, from
 /// the smallest to the largest x of a column's items and likewise in y for a
@@ -41,9 +42,9 @@ const EMPTY: Rectangle = Rectangle::new(
 /// updates. Stale spans cost at most what the fixed reach costs; the boxes
 /// still apply.
 ///
-/// The ancestor walk also stops at the coarsest level below the root that may
-/// hold items; insertion and update lower that level, and the refresh raises
-/// it again.
+/// The ancestor walk also stops at the coarsest level below the root that
+/// holds items, which a bitmask of the occupied levels keeps exact at all
+/// times.
 ///
 /// Boxes and spans consist of item coordinates, so their checks compare the
 /// same values as the intersection tests and need no rounding margin. Neither
@@ -52,30 +53,34 @@ const EMPTY: Rectangle = Rectangle::new(
 /// [`BoxedOverflowBoundGrid`]: crate::BoxedOverflowBoundGrid
 /// [`HierarchicalLooseGrid`]: crate::HierarchicalLooseGrid
 /// [`refresh_bounds`]: Self::refresh_bounds
-pub struct StripedOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
+pub struct SpanOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
+    /// Reciprocals of the node width and height, indexed by level. Position
+    /// and search multiply by them instead of dividing by the node size, and
+    /// `geometry` builds its cell edges with the same arithmetic.
+    inverse_node_size: Vec<(f64, f64)>,
     /// Indexed by level, parallel to `layers`.
     lines: Vec<LineSpan>,
-    /// No level below the root and coarser than this one holds items. The
-    /// refresh sets it to the coarsest such level that does, or
-    /// `MAX_LEVEL + 1` if none does; insertion and update only lower it, and
-    /// levels that empty out leave it unchanged until then, which costs search
-    /// only a few empty levels. With all items on the finest level, stopping
-    /// the ancestor walk here measured 10% faster.
-    coarsest_level: usize,
+    /// Bit `L` is set while level `L` holds items: storing an item sets the
+    /// bit of its level, and taking the last item off a level clears it. The
+    /// coarsest level below the root that holds items, where the ancestor walk
+    /// of search stops, is therefore exact at all times, not only after a
+    /// refresh. With all items on the finest level, stopping the walk there
+    /// measured 10% faster than walking every level.
+    occupied_levels: u64,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     /// Where the entry of each live handle is stored.
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> SpanOverflowBoundGrid<T, MAX_LEVEL> {
     /// Create a new grid with the given bounds.
     ///
     /// Nodes are square, which usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> StripedOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new(world_bounds: Rectangle) -> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
@@ -83,13 +88,13 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
     ///
     /// The root is `world_bounds` itself, so nodes take its aspect ratio
     /// instead of being square.
-    pub fn new_fit(world_bounds: Rectangle) -> StripedOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new_fit(world_bounds: Rectangle) -> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
     fn create<const FIT: bool>(
         world_bounds: Rectangle,
-    ) -> StripedOverflowBoundGrid<T, MAX_LEVEL> {
+    ) -> SpanOverflowBoundGrid<T, MAX_LEVEL> {
         let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
         assert!(
@@ -115,7 +120,7 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
             let mut vec = Vec::with_capacity(rows * cols);
             for _ in 0..rows {
                 for _ in 0..cols {
-                    vec.push(StripedOverflowBoundGridNode::new());
+                    vec.push(SpanOverflowBoundGridNode::new());
                 }
             }
             layers.push(Grid::from_vec(vec, cols));
@@ -137,14 +142,23 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
         };
 
         let mut geometry = Vec::with_capacity(layers.len());
-        geometry.push(LayerGeometry::default()); // Level zero is unused, like `layers[0]`.
+        let mut inverse_node_size = Vec::with_capacity(layers.len());
+        // Level zero is unused, like `layers[0]`.
+        geometry.push(LayerGeometry::default());
+        inverse_node_size.push((0.0, 0.0));
         for (level, grid) in layers.iter().enumerate().skip(1) {
-            geometry.push(LayerGeometry::new(
+            let (node_width, node_height) =
+                LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
+            let inverse = (1.0 / node_width, 1.0 / node_height);
+            geometry.push(LayerGeometry::with_reciprocal(
                 &root_bounds,
                 level,
                 grid.cols(),
                 grid.rows(),
+                inverse.0,
+                inverse.1,
             ));
+            inverse_node_size.push(inverse);
         }
 
         // One per level; the root's spans grow but are never read, as search
@@ -154,11 +168,12 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
             .map(|grid| LineSpan::new(grid.cols(), grid.rows()))
             .collect();
 
-        StripedOverflowBoundGrid {
+        SpanOverflowBoundGrid {
             layers,
             geometry,
+            inverse_node_size,
             lines,
-            coarsest_level: MAX_LEVEL as usize + 1,
+            occupied_levels: 0,
             root_bounds,
             world_bounds,
             slots: Slots::new(),
@@ -210,10 +225,9 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
 
     /// On every touched level, shrink the box of every node and the span of
     /// every column and row to the items held now, undoing the growth from
-    /// items that have since moved, shrunk or left; then recompute the
-    /// coarsest level. Visits every node of a touched level once, and the
-    /// items of its touched rows; untouched levels are already exact and are
-    /// skipped.
+    /// items that have since moved, shrunk or left. Visits every node of a
+    /// touched level once, and the items of its touched rows; untouched
+    /// levels are already exact and are skipped.
     ///
     /// A refreshed box is the union of its items, so the spans follow from
     /// the boxes, one per node rather than one per item.
@@ -253,14 +267,14 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
                 }
             }
         }
-        self.coarsest_level = (2..=MAX_LEVEL as usize)
-            .find(|&level| !self.geometry[level].is_empty())
-            .unwrap_or(MAX_LEVEL as usize + 1);
     }
 
     /// Widen the spans of the column and row of `coord` to cover `bounds`
-    /// stored there, and mark the level and row touched.
-    #[inline]
+    /// stored there, and mark the level and row touched. Every store runs
+    /// it; left to the inliner, it became a call once `cover` and the spans
+    /// grew with `lower` and `higher`, which cost the update path most of
+    /// what those saved.
+    #[inline(always)]
     fn grow_lines(&mut self, bounds: &Rectangle, (level, x, y): Coord) {
         self.lines[level].grow((x, y), bounds);
     }
@@ -283,23 +297,24 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
     /// and fewer than `2^L` times, clamped to `1..=MAX_LEVEL`.
     /// [`LayerGeometry`] caches the matching size limits of each level.
     fn level_for_size(&self, width: f64, height: f64) -> usize {
-        let multiple_x = (self.root_bounds.get_width() / width) as usize;
-        let multiple_y = (self.root_bounds.get_height() / height) as usize;
-        let level = usize::BITS - multiple_x.min(multiple_y).leading_zeros();
-        (level as usize).clamp(1, MAX_LEVEL as usize)
+        // The bit length of `(root / size) as usize` on each axis, from the
+        // exponents rather than by dividing.
+        let level_x = size_level(self.root_bounds.get_width(), width);
+        let level_y = size_level(self.root_bounds.get_height(), height);
+        level_x.min(level_y).clamp(1, MAX_LEVEL as i64) as usize
     }
 
     /// Cell of `level` whose area contains `point`, clamped into the grid.
     fn cell_containing(&self, level: usize, point: (f64, f64)) -> (usize, usize) {
         let grid = &self.layers[level];
-        let geometry = &self.geometry[level];
+        let (inverse_width, inverse_height) = self.inverse_node_size[level];
         let (origin_x, origin_y) = self.root_bounds.get_min();
-        let x = (((point.0 - origin_x) / geometry.node_width) as usize).min(grid.cols() - 1);
-        let y = (((point.1 - origin_y) / geometry.node_height) as usize).min(grid.rows() - 1);
+        let x = (((point.0 - origin_x) * inverse_width) as usize).min(grid.cols() - 1);
+        let y = (((point.1 - origin_y) * inverse_height) as usize).min(grid.rows() - 1);
         (x, y)
     }
 
-    fn get_root(&self) -> &StripedOverflowBoundGridNode<T> {
+    fn get_root(&self) -> &SpanOverflowBoundGridNode<T> {
         unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
@@ -318,8 +333,7 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
             item,
             handle,
         });
-        self.geometry[level].object_count += 1;
-        self.coarsest_level = self.coarsest_level.min(level);
+        self.occupy(level);
         handle
     }
 
@@ -333,7 +347,7 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
         debug_assert_eq!(entry.handle, handle);
         self.slots.free(handle);
         self.lines[level].mark_taken(y);
-        self.geometry[level].object_count -= 1;
+        self.vacate(level);
     }
 
     /// Update the bounds of an item and, if necessary, its node.
@@ -364,9 +378,8 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
         new_node.items.push(Entry { bounds, ..entry });
         // `grow_lines` marked the new level; mark the old one, which lost an item.
         self.lines[level].mark_taken(y);
-        self.geometry[nl].object_count += 1;
-        self.geometry[level].object_count -= 1;
-        self.coarsest_level = self.coarsest_level.min(nl);
+        self.occupy(nl);
+        self.vacate(level);
     }
 
     /// Overwrite the bounds of an entry that stays in its node, widening the
@@ -377,6 +390,27 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
         let node = &mut self.layers[level][y][x];
         node.grow(&bounds);
         node.items[index].bounds = bounds;
+    }
+
+    /// Count one more item on `level`.
+    fn occupy(&mut self, level: usize) {
+        self.geometry[level].object_count += 1;
+        self.occupied_levels |= 1 << level;
+    }
+
+    /// Count one item fewer on `level`, and clear its bit, without a branch,
+    /// if it is now empty.
+    fn vacate(&mut self, level: usize) {
+        self.geometry[level].object_count -= 1;
+        let emptied = self.geometry[level].is_empty() as u64;
+        self.occupied_levels &= !(emptied << level);
+    }
+
+    /// The coarsest level below the root that holds items, or `MAX_LEVEL + 1`
+    /// if none does.
+    fn coarsest_level(&self) -> usize {
+        // Level zero is unused and the root is searched separately.
+        ((self.occupied_levels & !0b11).trailing_zeros() as usize).min(MAX_LEVEL as usize + 1)
     }
 
     /// Take the entry at `index` out of a node. The entry that fills the gap
@@ -414,6 +448,37 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
+    /// Search with the bounds of every stored item, as [`search`](Self::search)
+    /// would item by item, and call `callback` with the item searched for and
+    /// each item found, the searched one included. The items are taken cell
+    /// by cell, depth first through the levels and in Morton order within
+    /// each, so that consecutive searches read nearby cells and the same
+    /// ancestors. The walk stops at the finest level that holds items but
+    /// visits every cell down to it, so where cells far outnumber items,
+    /// searching item by item is faster. On the search bench's distribution,
+    /// the `self_query` bench group measured it 8% faster than searching
+    /// item by item in random order with 10,000 items, and a one-off probe
+    /// outside the repository 27% with 640,000 items at the same
+    /// density, where the random order misses the cache.
+    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for entry in &layers[level][y][x].items {
+                    self.search(&entry.bounds, |found| callback(entry.item, found));
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up. Execute the callback for each item whose
     /// bounds intersect `bounds`.
     ///
@@ -423,42 +488,45 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
     ///
     /// [`HierarchicalLooseGrid::search`]: crate::HierarchicalLooseGrid::search
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        // Every comparison with NaN is false, so a query with a NaN corner
+        // meets nothing, while for a NaN minimum the scans would report the
+        // items of the nodes they take as inside it untested.
+        if bounds.has_nan() {
+            return;
+        }
         let max_level = MAX_LEVEL as usize;
         let level = self.level_for_size(bounds.get_width(), bounds.get_height());
         let (offset_x, offset_y) = self.root_bounds.get_min();
 
         let layers = &self.layers;
         if level != max_level {
-            // Top-left corner, relative to the root origin.
-            let min_x = bounds.min_x - offset_x;
-            let min_y = bounds.min_y - offset_y;
-
-            // Bottom-right corner, relative to the root origin.
-            let max_x = bounds.max_x - offset_x;
-            let max_y = bounds.max_y - offset_y;
-
-            let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
-            let calc_max = |n: f64| (n - 0.5).ceil() as usize;
+            // The query's corners relative to the root origin, in half nodes
+            // of the finest level; every level's scan range follows by shifts.
+            let half = half_node_corners(
+                [
+                    bounds.min_x - offset_x,
+                    bounds.min_y - offset_y,
+                    bounds.max_x - offset_x,
+                    bounds.max_y - offset_y,
+                ],
+                self.inverse_node_size[max_level],
+            );
 
             layers[level + 1..=max_level]
                 .iter()
                 .zip(&self.geometry[level + 1..=max_level])
                 .zip(&self.lines[level + 1..=max_level])
                 .rev()
-                .for_each(|((grid, geometry), lines)| {
+                .enumerate()
+                .for_each(|(shift, ((grid, geometry), lines))| {
                     if geometry.is_empty() {
                         return;
                     }
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
-                    let node_width = geometry.node_width;
-                    let node_height = geometry.node_height;
 
-                    let min_coord_x = calc_min(min_x / node_width);
-                    let min_coord_y = calc_min(min_y / node_height);
-
-                    let max_coord_x = calc_max(max_x / node_width).min(grid_width - 1);
-                    let max_coord_y = calc_max(max_y / node_height).min(grid_height - 1);
+                    let [min_coord_x, min_coord_y, max_coord_x, max_coord_y] =
+                        scan_range(half, shift as u32, (grid_width - 1, grid_height - 1));
 
                     // The fixed reach overshoots by about one column and row on
                     // each side; drop each such edge line whose span misses the
@@ -523,7 +591,7 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
         let (mut x, mut y) = self.cell_containing(level, bounds.get_center());
 
         // The root is searched last; levels coarser than `coarsest` hold nothing.
-        let coarsest = self.coarsest_level.clamp(2, level + 1);
+        let coarsest = self.coarsest_level().min(level + 1);
         self.layers[coarsest..=level]
             .iter()
             .zip(&self.geometry[coarsest..=level])
@@ -533,6 +601,11 @@ impl<T: Copy, const MAX_LEVEL: u8> StripedOverflowBoundGrid<T, MAX_LEVEL> {
                 if !geometry.is_empty() {
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
+                    // The unchecked reads below rely on the walk staying in the grid.
+                    debug_assert!(
+                        x < grid_width && y < grid_height,
+                        "walk cell ({x}, {y}) outside {grid_width}x{grid_height}"
+                    );
 
                     // Whether the span of each neighboring column and row meets
                     // the query. Clamped indices read an in-bounds line whose
@@ -662,16 +735,16 @@ impl LineSpan {
     fn widen(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
         self.widen_column(x, bounds);
         let row = &mut self.rows[y];
-        row[0] = row[0].min(bounds.min_y);
-        row[1] = row[1].max(bounds.max_y);
+        row[0] = lower(row[0], bounds.min_y);
+        row[1] = higher(row[1], bounds.max_y);
     }
 
     /// Widen column `x` alone to cover `bounds`.
     #[inline]
     fn widen_column(&mut self, x: usize, bounds: &Rectangle) {
         let column = &mut self.columns[x];
-        column[0] = column[0].min(bounds.min_x);
-        column[1] = column[1].max(bounds.max_x);
+        column[0] = lower(column[0], bounds.min_x);
+        column[1] = higher(column[1], bounds.max_x);
     }
 
     fn clear(&mut self) {
@@ -680,14 +753,14 @@ impl LineSpan {
     }
 }
 
-struct StripedOverflowBoundGridNode<T: Copy> {
+struct SpanOverflowBoundGridNode<T: Copy> {
     /// Covers the bounds of every item in `items`; [`EMPTY`] while there are
     /// none.
     bounds: Rectangle,
     items: Vec<Entry<T>>,
 }
 
-impl<T: Copy> StripedOverflowBoundGridNode<T> {
+impl<T: Copy> SpanOverflowBoundGridNode<T> {
     fn new() -> Self {
         Self {
             bounds: EMPTY,
@@ -729,14 +802,14 @@ impl<T: Copy> StripedOverflowBoundGridNode<T> {
 /// unchanged, which is harmless because an item with one intersects no query.
 #[inline]
 fn cover(target: &mut Rectangle, bounds: &Rectangle) {
-    target.min_x = target.min_x.min(bounds.min_x);
-    target.min_y = target.min_y.min(bounds.min_y);
-    target.max_x = target.max_x.max(bounds.max_x);
-    target.max_y = target.max_y.max(bounds.max_y);
+    target.min_x = lower(target.min_x, bounds.min_x);
+    target.min_y = lower(target.min_y, bounds.min_y);
+    target.max_x = higher(target.max_x, bounds.max_x);
+    target.max_y = higher(target.max_y, bounds.max_y);
 }
 
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for StripedOverflowBoundGrid<T, MAX_LEVEL> {}
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for StripedOverflowBoundGrid<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for SpanOverflowBoundGrid<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for SpanOverflowBoundGrid<T, MAX_LEVEL> {}
 
 #[cfg(test)]
 mod tests {
@@ -744,13 +817,61 @@ mod tests {
     use rand::prelude::*;
 
     const MAX_LEVEL: u8 = 7;
-    type Tree = StripedOverflowBoundGrid<usize, MAX_LEVEL>;
+    type Tree = SpanOverflowBoundGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
         Rectangle::new(0.0, 0.0, 20000.0, 20000.0),
         Rectangle::new(0.3, -0.7, 1000.1, 333.3),
     ];
+    /// The update shortcut must place a center in the same cell as
+    /// `position`, also within a few floats of every cell edge, where
+    /// multiplying by the reciprocal of the node size and dividing by it can
+    /// round to different cells.
+    #[test]
+    fn update_shortcut_agrees_with_position_at_cell_edges() {
+        for world in WORLDS {
+            for tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
+                let origin = tree.root_bounds.get_min();
+                for level in 2..=MAX_LEVEL as usize {
+                    let geometry = &tree.geometry[level];
+                    let grid = &tree.layers[level];
+                    let (node_width, node_height) = (geometry.node_width, geometry.node_height);
+                    let inside = (origin.0 + node_width * 0.5, origin.1 + node_height * 0.5);
+                    let near = |edge: f64| {
+                        let mut points = vec![edge];
+                        let (mut up, mut down) = (edge, edge);
+                        for _ in 0..3 {
+                            up = up.next_up();
+                            down = down.next_down();
+                            points.extend([up, down]);
+                        }
+                        points
+                    };
+                    let mut centers = Vec::new();
+                    for i in 1..grid.cols() {
+                        for x in near(origin.0 + node_width * i as f64) {
+                            centers.push((x, inside.1));
+                        }
+                    }
+                    for i in 1..grid.rows() {
+                        for y in near(origin.1 + node_height * i as f64) {
+                            centers.push((inside.0, y));
+                        }
+                    }
+                    for center in centers {
+                        let cell = tree.cell_containing(level, center);
+                        let relative = (center.0 - origin.0, center.1 - origin.1);
+                        assert!(
+                            geometry.matches_cell(relative, cell),
+                            "world {world:?}, level {level}, center {center:?}, cell {cell:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
 
     /// Bounds of any size from the root down to below the finest node,
     /// centered anywhere in the root, which puts some outside the world.
@@ -775,7 +896,7 @@ mod tests {
     }
 
     /// Union of the bounds of the items of `node`; `EMPTY` without any.
-    fn union<T: Copy>(node: &StripedOverflowBoundGridNode<T>) -> Rectangle {
+    fn union<T: Copy>(node: &SpanOverflowBoundGridNode<T>) -> Rectangle {
         let side = |pick: fn(&Rectangle) -> f64, start: f64, fold: fn(f64, f64) -> f64| {
             node.items
                 .iter()
@@ -966,23 +1087,50 @@ mod tests {
             .unwrap_or(MAX_LEVEL as usize + 1)
     }
 
-    /// No level below the root and coarser than `coarsest_level` may hold
-    /// items at any time; right after a refresh it must be the coarsest level
-    /// that does.
+    /// `coarsest_level()` must be the coarsest level below the root that holds
+    /// items after every insertion, update and removal, refreshed or not. With
+    /// at most nine items, levels keep emptying and filling again.
     #[test]
-    fn coarsest_level_never_passes_items() {
-        exercise(2, |tree, step, refreshed| {
-            let actual = coarsest_occupied(tree);
-            if refreshed {
-                assert_eq!(tree.coarsest_level, actual, "step {step}");
-            } else {
-                assert!(
-                    tree.coarsest_level <= actual,
-                    "step {step}: level {} is finer than {actual}",
-                    tree.coarsest_level
-                );
+    fn coarsest_level_follows_the_items() {
+        let mut rng = StdRng::seed_from_u64(5);
+        for world in WORLDS {
+            for mut tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
+                let root = tree.get_bounds().clone();
+                let mut handles: Vec<ItemHandle> = Vec::new();
+                let mut raised = 0;
+                for step in 0..3000 {
+                    let before = tree.coarsest_level();
+                    let operation = match handles.len() {
+                        0 | 1 => 0,
+                        9.. => 2,
+                        _ => rng.gen_range(0..3),
+                    };
+                    match operation {
+                        0 => {
+                            let bounds = random_bounds(&mut rng, &root);
+                            handles.push(tree.insert(bounds, step));
+                        }
+                        1 => {
+                            let bounds = random_bounds(&mut rng, &root);
+                            tree.update(bounds, handles[rng.gen_range(0..handles.len())]);
+                        }
+                        _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
+                    }
+                    assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
+                    raised += (tree.coarsest_level() > before) as usize;
+                    if rng.gen_bool(0.1) {
+                        tree.refresh_bounds();
+                        assert_eq!(
+                            tree.coarsest_level(),
+                            coarsest_occupied(&tree),
+                            "step {step}, refreshed"
+                        );
+                    }
+                }
+                // The coarsest level emptied out often enough to exercise clearing its bit.
+                assert!(raised > 100, "the coarsest level emptied only {raised} times");
             }
-        });
+        }
     }
 
     /// An item that grows into a level coarser than any other must be found
@@ -1160,5 +1308,63 @@ mod tests {
         assert_eq!(rows(&tree), [7]);
         tree.refresh_bounds();
         assert_eq!(rows(&tree), []);
+    }
+
+    /// Items with a NaN coordinate, which meet no query, go to the root. Their
+    /// other sides grow its box, but no side of it, nor of the spans of its
+    /// column and row, becomes NaN, whichever comes first and before and
+    /// after a refresh; the box therefore still meets queries, and searches
+    /// find the other items there. The root's spans are never read.
+    #[test]
+    fn nan_items_leave_the_root_box_to_the_others() {
+        // Centered outside the world, so stored in the root.
+        let outside = Rectangle::center_rect(-10.0, 100.0, 4.0, 4.0);
+        let nan = [
+            Rectangle::new(f64::NAN, 90.0, -5.0, 110.0),
+            Rectangle::new(-15.0, f64::NAN, f64::NAN, 102.0),
+            Rectangle::new(f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+        ];
+        let query = Rectangle::center_rect(-10.0, 100.0, 2.0, 2.0);
+        for nan_first in [true, false] {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let mut handles = Vec::new();
+            if nan_first {
+                handles.extend(nan.iter().map(|bounds| tree.insert(bounds.clone(), 1)));
+            }
+            tree.insert(outside.clone(), 0);
+            if !nan_first {
+                handles.extend(nan.iter().map(|bounds| tree.insert(bounds.clone(), 1)));
+            }
+            // Replaced in place by other NaN bounds.
+            tree.update(nan[2].clone(), handles[0]);
+            assert_eq!(tree.position(&outside), (1, 0, 0));
+            for refreshed in [false, true] {
+                if refreshed {
+                    tree.refresh_bounds();
+                }
+                let context = format!("NaN first {nan_first}, refreshed {refreshed}");
+                let root = &tree.layers[1][0][0].bounds;
+                let lines = &tree.lines[1];
+                let sides = [root.min_x, root.min_y, root.max_x, root.max_y];
+                let spans = [lines.columns[0], lines.rows[0]].concat();
+                assert!(!sides.iter().chain(&spans).any(|side| side.is_nan()), "{context}: {root:?}, {spans:?}");
+                // The sides the items have, as `f64::min` and `max` fold them.
+                let exact = union(&tree.layers[1][0][0]);
+                if refreshed {
+                    assert_eq!(*root, exact, "{context}");
+                } else {
+                    assert!(
+                        root.min_x <= exact.min_x
+                            && root.min_y <= exact.min_y
+                            && root.max_x >= exact.max_x
+                            && root.max_y >= exact.max_y,
+                        "{context}: {root:?} misses {exact:?}"
+                    );
+                }
+                let mut found = Vec::new();
+                tree.search(&query, |id| found.push(id));
+                assert_eq!(found, [0], "{context}");
+            }
+        }
     }
 }

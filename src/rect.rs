@@ -91,4 +91,10 @@ impl Rectangle {
     pub fn intersects(&self, b: &Rectangle) -> bool {
         self.min_x < b.max_x && b.min_x < self.max_x && self.min_y < b.max_y && b.min_y < self.max_y
     }
+
+    /// Whether a corner is NaN, which makes the rectangle intersect nothing.
+    #[inline]
+    pub fn has_nan(&self) -> bool {
+        self.min_x.is_nan() | self.min_y.is_nan() | self.max_x.is_nan() | self.max_y.is_nan()
+    }
 }

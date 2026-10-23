@@ -1,13 +1,14 @@
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
-use crate::layer_geometry::LayerGeometry;
+use crate::cell_order::for_each_cell_hierarchically;
+use crate::layer_geometry::{LayerGeometry, half_node_corners, scan_range, size_level};
 use crate::overflow_bound_grid::DirectionalOverflow;
-use crate::overflow_bound::cell_overflow;
+use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::Rectangle;
 use grid::*;
 
 /// `(level, x, y)`
 type Coord = (usize, usize, usize);
-type Layers<T> = Vec<Grid<IncomingOverflowBoundGridNode<T>>>;
+type Layers<T> = Vec<Grid<HaloOverflowBoundGridNode<T>>>;
 
 /// Box of a node without items. Every comparison of [`Rectangle::intersects`]
 /// fails against it, so search rejects the node without a separate check.
@@ -18,9 +19,10 @@ const EMPTY: Rectangle = Rectangle::new(
     f64::NEG_INFINITY,
 );
 
-/// [`StripedOverflowBoundGrid`] with the neighbor pruning of the ancestor
-/// walk moved from the stripes of a level to the cells themselves. It uses
-/// the storage, positioning and handles of [`HierarchicalLooseGrid`]; every
+/// [`SpanOverflowBoundGrid`] with the neighbor pruning of the ancestor
+/// walk moved from the column and row spans of a level to the cells
+/// themselves. It uses the storage, positioning and handles of
+/// [`HierarchicalLooseGrid`]; every
 /// node keeps a box covering its items and copies of the sides of its eight
 /// neighbors' boxes that face it, that is, how far each neighbor's items
 /// reach towards the node. The walk reads the query cell's node on every
@@ -30,38 +32,43 @@ const EMPTY: Rectangle = Rectangle::new(
 /// nearly always meets the query. A neighbor that is read is still skipped
 /// when its box misses the query.
 ///
-/// The column and row spans of the striped grid remain, but only trim the
-/// edges of the scan over finer levels.
+/// The column and row spans of [`SpanOverflowBoundGrid`] remain, but only
+/// trim the edges of the scan over finer levels.
 ///
 /// Insertion and update only widen the box of the target node and the spans
 /// of its column and row, and mark the level stale and the row touched; the
 /// copies in the neighbors are not updated. Until the refresh, the walk
 /// judges the neighbors of a query cell in or next to a touched row of a
-/// stale level by the spans, as the striped grid does and at its cost.
+/// stale level by the spans, as [`SpanOverflowBoundGrid`] does and at its
+/// cost.
 /// Pushing every grown side to the three neighbors it faces on each update
-/// instead measured the update benchmark 50-90% slower than the striped
-/// grid, for a search gain realized only once a frame's updates are done.
+/// instead measured the update benchmark 50-90% slower than
+/// [`SpanOverflowBoundGrid`], for a search gain realized only once a frame's updates are done.
 /// Removal and moving out leave boxes, spans and copies unchanged, except
 /// that a node left without items resets its box. Boxes and spans therefore
 /// stay valid as items move, shrink or leave, but tighten only in
 /// [`refresh_bounds`], which also brings the copies up to date and clears
 /// the marks; the caller chooses when, e.g. once per frame after the updates.
 ///
-/// The walk also stops at the coarsest level below the root that may hold
-/// items; insertion and update lower this level and the refresh raises it.
+/// The walk also stops at the coarsest level below the root that holds items,
+/// which a bitmask of the occupied levels keeps exact at all times.
 ///
 /// Boxes, spans and copies consist of item coordinates, so their checks
 /// compare the same values as the intersection tests and need no rounding
 /// margin. None of them needs cell edges, which also keeps them cheap to
 /// maintain.
 ///
-/// [`StripedOverflowBoundGrid`]: crate::StripedOverflowBoundGrid
+/// [`SpanOverflowBoundGrid`]: crate::SpanOverflowBoundGrid
 /// [`HierarchicalLooseGrid`]: crate::HierarchicalLooseGrid
 /// [`refresh_bounds`]: Self::refresh_bounds
-pub struct IncomingOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
+pub struct HaloOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
+    /// Reciprocals of the node width and height, indexed by level. Position
+    /// and search multiply by them instead of dividing by the node size, and
+    /// `geometry` builds its cell edges with the same arithmetic.
+    inverse_node_size: Vec<(f64, f64)>,
     /// Indexed by level, parallel to `layers`.
     lines: Vec<LineSpan>,
     /// Indexed by level, parallel to `layers`.
@@ -70,37 +77,38 @@ pub struct IncomingOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     /// order. Kept apart from the nodes so that these stay 56 bytes for the
     /// scan and for updates, which never touch the copies; the walk reads one
     /// entry here beside its node on every level.
-    incoming: Vec<Box<[Incoming]>>,
-    /// No level coarser than this holds items, apart from the root;
-    /// `MAX_LEVEL + 1` if none does. A level that empties leaves it unchanged
-    /// until the next refresh, which costs search only a few empty levels.
-    /// With all items on the finest level, stopping the walk here measured
-    /// 10% faster.
-    coarsest_level: usize,
+    halo: Vec<Box<[Halo]>>,
+    /// Bit `L` is set while level `L` holds items: storing an item sets the
+    /// bit of its level, and taking the last item off a level clears it. The
+    /// coarsest level below the root that holds items, where the ancestor walk
+    /// of search stops, is therefore exact at all times, not only after a
+    /// refresh. With all items on the finest level, stopping the walk there
+    /// measured 10% faster than walking every level.
+    occupied_levels: u64,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     /// Location of the entry of each live handle.
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// Create a new grid with the given bounds.
     ///
     /// Use square nodes, which usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new(world_bounds: Rectangle) -> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
     /// Create a new grid with the given bounds.
     ///
     /// Fit the nodes to the given bounds instead of making them square.
-    pub fn new_fit(world_bounds: Rectangle) -> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new_fit(world_bounds: Rectangle) -> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
     fn create<const FIT: bool>(
         world_bounds: Rectangle,
-    ) -> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+    ) -> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
         assert!(
@@ -126,7 +134,7 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             let mut vec = Vec::with_capacity(rows * cols);
             for _ in 0..rows {
                 for _ in 0..cols {
-                    vec.push(IncomingOverflowBoundGridNode::new());
+                    vec.push(HaloOverflowBoundGridNode::new());
                 }
             }
             layers.push(Grid::from_vec(vec, cols));
@@ -148,14 +156,23 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
         };
 
         let mut geometry = Vec::with_capacity(layers.len());
-        geometry.push(LayerGeometry::default()); // Level zero is unused, like `layers[0]`.
+        let mut inverse_node_size = Vec::with_capacity(layers.len());
+        // Level zero is unused, like `layers[0]`.
+        geometry.push(LayerGeometry::default());
+        inverse_node_size.push((0.0, 0.0));
         for (level, grid) in layers.iter().enumerate().skip(1) {
-            geometry.push(LayerGeometry::new(
+            let (node_width, node_height) =
+                LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
+            let inverse = (1.0 / node_width, 1.0 / node_height);
+            geometry.push(LayerGeometry::with_reciprocal(
                 &root_bounds,
                 level,
                 grid.cols(),
                 grid.rows(),
+                inverse.0,
+                inverse.1,
             ));
+            inverse_node_size.push(inverse);
         }
 
         // The root's spans grow like those of every level but are never read:
@@ -166,18 +183,19 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             .collect();
 
         let marks = vec![Marks::default(); layers.len()].into_boxed_slice();
-        let incoming = layers
+        let halo = layers
             .iter()
-            .map(|grid| vec![NO_INCOMING; grid.rows() * grid.cols()].into_boxed_slice())
+            .map(|grid| vec![NO_HALO; grid.rows() * grid.cols()].into_boxed_slice())
             .collect();
 
-        IncomingOverflowBoundGrid {
+        HaloOverflowBoundGrid {
             layers,
             geometry,
+            inverse_node_size,
             lines,
             marks,
-            incoming,
-            coarsest_level: MAX_LEVEL as usize + 1,
+            halo,
+            occupied_levels: 0,
             root_bounds,
             world_bounds,
             slots: Slots::new(),
@@ -248,13 +266,13 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             }
             let lines = &mut self.lines[level];
             let grid = &mut self.layers[level];
-            let incoming = &mut self.incoming[level];
+            let halo = &mut self.halo[level];
             if self.geometry[level].is_empty() {
                 // Every node reset its box as it emptied; only the spans and
                 // copies remain to reset.
                 lines.clear();
                 lines.row_touched.fill(false);
-                incoming.fill(NO_INCOMING);
+                halo.fill(NO_HALO);
                 continue;
             }
             let rows = grid.rows();
@@ -262,7 +280,7 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             // boxes of all rows; a row's own span and boxes are rebuilt only
             // if the row is touched.
             lines.columns.fill(NOWHERE);
-            let shrink_row = |grid: &mut Grid<IncomingOverflowBoundGridNode<T>>,
+            let shrink_row = |grid: &mut Grid<HaloOverflowBoundGridNode<T>>,
                               lines: &mut LineSpan,
                               y: usize| {
                 if lines.row_touched[y] {
@@ -290,14 +308,11 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
                     shrink_row(grid, lines, y + 1);
                 }
                 if lines.near_touched(y) {
-                    pull_incoming_row(grid, incoming, y);
+                    pull_halo_row(grid, halo, y);
                 }
             }
             lines.row_touched.fill(false);
         }
-        self.coarsest_level = (2..=MAX_LEVEL as usize)
-            .find(|&level| !self.geometry[level].is_empty())
-            .unwrap_or(MAX_LEVEL as usize + 1);
     }
 
     /// Record that an item was stored on `level`, so a box there may have
@@ -317,8 +332,12 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
     }
 
     /// Widen the spans of the column and row of `coord` to cover `bounds`
-    /// stored there, and mark the row touched.
-    #[inline]
+    /// stored there, and mark the row touched. Every store runs it. Once
+    /// `cover` and the spans grew with `lower` and `higher`, the inliner left
+    /// its call in `replace_bounds` out of line; that cost nothing measurable
+    /// here, unlike in [`SpanOverflowBoundGrid`](crate::SpanOverflowBoundGrid),
+    /// but it is forced inline as there.
+    #[inline(always)]
     fn grow_lines(&mut self, bounds: &Rectangle, (level, x, y): Coord) {
         self.lines[level].grow((x, y), bounds);
     }
@@ -342,23 +361,24 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
     /// times but fewer than `2^L` times, clamped to `1..=MAX_LEVEL`.
     /// [`LayerGeometry`] caches the matching size limits of each level.
     fn level_for_size(&self, width: f64, height: f64) -> usize {
-        let multiple_x = (self.root_bounds.get_width() / width) as usize;
-        let multiple_y = (self.root_bounds.get_height() / height) as usize;
-        let level = usize::BITS - multiple_x.min(multiple_y).leading_zeros();
-        (level as usize).clamp(1, MAX_LEVEL as usize)
+        // The bit length of `(root / size) as usize` on each axis, from the
+        // exponents rather than by dividing.
+        let level_x = size_level(self.root_bounds.get_width(), width);
+        let level_y = size_level(self.root_bounds.get_height(), height);
+        level_x.min(level_y).clamp(1, MAX_LEVEL as i64) as usize
     }
 
     /// Cell of `level` whose area contains `point`, clamped into the grid.
     fn cell_containing(&self, level: usize, point: (f64, f64)) -> (usize, usize) {
         let grid = &self.layers[level];
-        let geometry = &self.geometry[level];
+        let (inverse_width, inverse_height) = self.inverse_node_size[level];
         let (origin_x, origin_y) = self.root_bounds.get_min();
-        let x = (((point.0 - origin_x) / geometry.node_width) as usize).min(grid.cols() - 1);
-        let y = (((point.1 - origin_y) / geometry.node_height) as usize).min(grid.rows() - 1);
+        let x = (((point.0 - origin_x) * inverse_width) as usize).min(grid.cols() - 1);
+        let y = (((point.1 - origin_y) * inverse_height) as usize).min(grid.rows() - 1);
         (x, y)
     }
 
-    fn get_root(&self) -> &IncomingOverflowBoundGridNode<T> {
+    fn get_root(&self) -> &HaloOverflowBoundGridNode<T> {
         unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
@@ -379,8 +399,7 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             handle,
         });
         self.mark_stored(level);
-        self.geometry[level].object_count += 1;
-        self.coarsest_level = self.coarsest_level.min(level);
+        self.occupy(level);
         handle
     }
 
@@ -394,7 +413,7 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
         debug_assert_eq!(entry.handle, handle);
         self.slots.free(handle);
         self.mark_taken(level, y);
-        self.geometry[level].object_count -= 1;
+        self.vacate(level);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the grid.
@@ -426,9 +445,8 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
         new_node.items.push(Entry { bounds, ..entry });
         self.mark_stored(nl);
         self.mark_taken(level, y);
-        self.geometry[nl].object_count += 1;
-        self.geometry[level].object_count -= 1;
-        self.coarsest_level = self.coarsest_level.min(nl);
+        self.occupy(nl);
+        self.vacate(level);
     }
 
     /// Overwrite the bounds of an entry that stays in its node, and grow the
@@ -440,6 +458,27 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
         node.grow(&bounds);
         node.items[index].bounds = bounds;
         self.mark_stored(level);
+    }
+
+    /// Count one more item on `level`.
+    fn occupy(&mut self, level: usize) {
+        self.geometry[level].object_count += 1;
+        self.occupied_levels |= 1 << level;
+    }
+
+    /// Count one item fewer on `level`, and clear its bit, without a branch,
+    /// if it is now empty.
+    fn vacate(&mut self, level: usize) {
+        self.geometry[level].object_count -= 1;
+        let emptied = self.geometry[level].is_empty() as u64;
+        self.occupied_levels &= !(emptied << level);
+    }
+
+    /// The coarsest level below the root that holds items, or `MAX_LEVEL + 1`
+    /// if none does.
+    fn coarsest_level(&self) -> usize {
+        // Level zero is unused and the root is searched separately.
+        ((self.occupied_levels & !0b11).trailing_zeros() as usize).min(MAX_LEVEL as usize + 1)
     }
 
     /// Remove the entry at `index` from a node and return it. The entry that
@@ -479,6 +518,37 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
+    /// Search with the bounds of every stored item, as [`search`](Self::search)
+    /// would item by item, and call `callback` with the item searched for and
+    /// each item found, the searched one included. The items are taken cell
+    /// by cell, depth first through the levels and in Morton order within
+    /// each, so that consecutive searches read nearby cells and the same
+    /// ancestors. The walk stops at the finest level that holds items but
+    /// visits every cell down to it, so where cells far outnumber items,
+    /// searching item by item is faster. On the search bench's distribution,
+    /// the `self_query` bench group measured it 15% faster than searching
+    /// item by item in random order with 10,000 items, and a one-off probe
+    /// outside the repository 43% with 640,000 items at the same
+    /// density, where the random order misses the cache.
+    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for entry in &layers[level][y][x].items {
+                    self.search(&entry.bounds, |found| callback(entry.item, found));
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up. Call `callback` for each item found.
     ///
     /// Follows [`HierarchicalLooseGrid::search`], except that the ancestor
@@ -490,42 +560,45 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
     ///
     /// [`HierarchicalLooseGrid::search`]: crate::HierarchicalLooseGrid::search
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        // Every comparison with NaN is false, so a query with a NaN corner
+        // meets nothing, while for a NaN minimum the scans would report the
+        // items of the nodes they take as inside it untested.
+        if bounds.has_nan() {
+            return;
+        }
         let max_level = MAX_LEVEL as usize;
         let level = self.level_for_size(bounds.get_width(), bounds.get_height());
         let (offset_x, offset_y) = self.root_bounds.get_min();
 
         let layers = &self.layers;
         if level != max_level {
-            // Top left.
-            let min_x = bounds.min_x - offset_x;
-            let min_y = bounds.min_y - offset_y;
-
-            // Bottom right.
-            let max_x = bounds.max_x - offset_x;
-            let max_y = bounds.max_y - offset_y;
-
-            let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
-            let calc_max = |n: f64| (n - 0.5).ceil() as usize;
+            // The query's corners relative to the root origin, in half nodes
+            // of the finest level; every level's scan range follows by shifts.
+            let half = half_node_corners(
+                [
+                    bounds.min_x - offset_x,
+                    bounds.min_y - offset_y,
+                    bounds.max_x - offset_x,
+                    bounds.max_y - offset_y,
+                ],
+                self.inverse_node_size[max_level],
+            );
 
             layers[level + 1..=max_level]
                 .iter()
                 .zip(&self.geometry[level + 1..=max_level])
                 .zip(&self.lines[level + 1..=max_level])
                 .rev()
-                .for_each(|((grid, geometry), lines)| {
+                .enumerate()
+                .for_each(|(shift, ((grid, geometry), lines))| {
                     if geometry.is_empty() {
                         return;
                     }
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
-                    let node_width = geometry.node_width;
-                    let node_height = geometry.node_height;
 
-                    let min_coord_x = calc_min(min_x / node_width);
-                    let min_coord_y = calc_min(min_y / node_height);
-
-                    let max_coord_x = calc_max(max_x / node_width).min(grid_width - 1);
-                    let max_coord_y = calc_max(max_y / node_height).min(grid_height - 1);
+                    let [min_coord_x, min_coord_y, max_coord_x, max_coord_y] =
+                        scan_range(half, shift as u32, (grid_width - 1, grid_height - 1));
 
                     // The fixed reach overshoots by about one column and row
                     // per side; drop an edge column or row whose span misses
@@ -590,22 +663,30 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
         let (mut x, mut y) = self.cell_containing(level, bounds.get_center());
 
         // The root is searched below; levels coarser than this hold nothing.
-        let coarsest = self.coarsest_level.clamp(2, level + 1);
+        let coarsest = self.coarsest_level().min(level + 1);
         self.layers[coarsest..=level]
             .iter()
             .zip(&self.geometry[coarsest..=level])
             .zip(&self.lines[coarsest..=level])
             .zip(&self.marks[coarsest..=level])
-            .zip(&self.incoming[coarsest..=level])
+            .zip(&self.halo[coarsest..=level])
             .rev()
-            .for_each(|((((grid, geometry), lines), marks), incoming)| {
+            .for_each(|((((grid, geometry), lines), marks), halo)| {
                 if !geometry.is_empty() {
+                    // The unchecked reads of both searches rely on the walk
+                    // staying in the grid.
+                    debug_assert!(
+                        x < grid.cols() && y < grid.rows(),
+                        "walk cell ({x}, {y}) outside {}x{}",
+                        grid.cols(),
+                        grid.rows()
+                    );
                     // Copies can be stale only on a stale level, so the row
                     // marks are read only there.
                     if marks.stale && lines.near_touched(y) {
                         search_3x3_by_spans(grid, lines, (x, y), bounds, callback);
                     } else {
-                        search_3x3_by_copies(grid, incoming, (x, y), bounds, callback);
+                        search_3x3_by_copies(grid, halo, (x, y), bounds, callback);
                     }
                 }
                 // Advance along the ancestor path even on an empty level.
@@ -618,40 +699,40 @@ impl<T: Copy, const MAX_LEVEL: u8> IncomingOverflowBoundGrid<T, MAX_LEVEL> {
 }
 
 /// Search node `(x, y)` of `grid` and those of its eight neighbors whose
-/// copies in `incoming` reach the query, where the copies of row `y` are not
+/// copies in `halo` reach the query, where the copies of row `y` are not
 /// stale.
 #[inline]
 fn search_3x3_by_copies<T: Copy>(
-    grid: &Grid<IncomingOverflowBoundGridNode<T>>,
-    incoming: &[Incoming],
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
+    halo: &[Halo],
     (x, y): (usize, usize),
     bounds: &Rectangle,
     callback: &mut impl FnMut(T),
 ) {
-    // SAFETY: `(x, y)` is a node of `grid`, and `incoming` holds one entry
+    // SAFETY: `(x, y)` is a node of `grid`, and `halo` holds one entry
     // per node in the same order. An edge node keeps the initial copies for
     // its missing neighbors, which fail every comparison, so the indices
     // below stay inside the grid.
     unsafe {
         let node = grid.get_unchecked(y, x);
-        let incoming = incoming.get_unchecked(y * grid.cols() + x);
+        let halo = halo.get_unchecked(y * grid.cols() + x);
 
         // Whether each neighbor's items may reach the query, per the copies
         // in this node. All eight are computed up front; short-circuit
         // branches here measured search 50% slower on a scene where the
         // outcomes vary.
-        let before = bounds.min_x < incoming.left;
-        let after = bounds.max_x > incoming.right;
-        let up = bounds.min_y < incoming.top;
-        let down = bounds.max_y > incoming.bottom;
+        let before = bounds.min_x < halo.left;
+        let after = bounds.max_x > halo.right;
+        let up = bounds.min_y < halo.top;
+        let down = bounds.max_y > halo.bottom;
         let up_before =
-            (bounds.min_x < incoming.top_left[0]) & (bounds.min_y < incoming.top_left[1]);
+            (bounds.min_x < halo.top_left[0]) & (bounds.min_y < halo.top_left[1]);
         let up_after =
-            (bounds.max_x > incoming.top_right[0]) & (bounds.min_y < incoming.top_right[1]);
+            (bounds.max_x > halo.top_right[0]) & (bounds.min_y < halo.top_right[1]);
         let down_before =
-            (bounds.min_x < incoming.bottom_left[0]) & (bounds.max_y > incoming.bottom_left[1]);
+            (bounds.min_x < halo.bottom_left[0]) & (bounds.max_y > halo.bottom_left[1]);
         let down_after =
-            (bounds.max_x > incoming.bottom_right[0]) & (bounds.max_y > incoming.bottom_right[1]);
+            (bounds.max_x > halo.bottom_right[0]) & (bounds.max_y > halo.bottom_right[1]);
         debug_assert!(!(before | up_before | down_before) || x != 0);
         debug_assert!(!(after | up_after | down_after) || x + 1 != grid.cols());
         debug_assert!(!(up | up_before | up_after) || y != 0);
@@ -695,12 +776,12 @@ fn search_3x3_by_copies<T: Copy>(
 
 /// Search node `(x, y)` of `grid` and those of its eight neighbors whose
 /// column and row spans reach the query, where the copies of row `y` may be
-/// behind the boxes; [`StripedOverflowBoundGrid`] does this on every level.
+/// behind the boxes; [`SpanOverflowBoundGrid`] does this on every level.
 ///
-/// [`StripedOverflowBoundGrid`]: crate::StripedOverflowBoundGrid
+/// [`SpanOverflowBoundGrid`]: crate::SpanOverflowBoundGrid
 #[inline]
 fn search_3x3_by_spans<T: Copy>(
-    grid: &Grid<IncomingOverflowBoundGridNode<T>>,
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
     lines: &LineSpan,
     (x, y): (usize, usize),
     bounds: &Rectangle,
@@ -846,16 +927,16 @@ impl LineSpan {
     fn widen(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
         self.grow_column(x, bounds);
         let row = &mut self.rows[y];
-        row[0] = row[0].min(bounds.min_y);
-        row[1] = row[1].max(bounds.max_y);
+        row[0] = lower(row[0], bounds.min_y);
+        row[1] = higher(row[1], bounds.max_y);
     }
 
     /// Widen column `x` alone to cover `bounds`.
     #[inline]
     fn grow_column(&mut self, x: usize, bounds: &Rectangle) {
         let column = &mut self.columns[x];
-        column[0] = column[0].min(bounds.min_x);
-        column[1] = column[1].max(bounds.max_x);
+        column[0] = lower(column[0], bounds.min_x);
+        column[1] = higher(column[1], bounds.max_x);
     }
 
     fn clear(&mut self) {
@@ -874,7 +955,7 @@ impl LineSpan {
 /// the refresh copies box sides as they are and the walk compares them with
 /// the query directly, with no cell edges.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Incoming {
+struct Halo {
     /// Largest `max_x` of the items of the left neighbor `(x - 1, y)`.
     left: f64,
     /// Smallest `min_x` of the items of the right neighbor `(x + 1, y)`.
@@ -894,9 +975,9 @@ struct Incoming {
 }
 
 /// Copies for eight neighbors without items, that is, with [`EMPTY`] boxes.
-const NO_INCOMING: Incoming = Incoming::of_boxes([&EMPTY; 8]);
+const NO_HALO: Halo = Halo::of_boxes([&EMPTY; 8]);
 
-impl Incoming {
+impl Halo {
     /// Copies of the facing sides of the eight neighbors' boxes, given in
     /// the order left, right, top, bottom, top left, top right, bottom left,
     /// bottom right.
@@ -925,7 +1006,7 @@ impl Incoming {
     /// grid has no node on that side of it.
     #[inline(always)]
     unsafe fn of_neighbors<T: Copy>(
-        grid: &Grid<IncomingOverflowBoundGridNode<T>>,
+        grid: &Grid<HaloOverflowBoundGridNode<T>>,
         (x, y): (usize, usize),
         [has_left, has_right]: [bool; 2],
         [has_top, has_bottom]: [bool; 2],
@@ -955,7 +1036,7 @@ impl Incoming {
 /// `(x, y)` must be a node of `grid` when `present`.
 #[inline(always)]
 unsafe fn box_at<T: Copy>(
-    grid: &Grid<IncomingOverflowBoundGridNode<T>>,
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
     present: bool,
     x: usize,
     y: usize,
@@ -967,23 +1048,23 @@ unsafe fn box_at<T: Copy>(
     }
 }
 
-/// Set the copies in `incoming` of every node of row `y` of `grid` to the
+/// Set the copies in `halo` of every node of row `y` of `grid` to the
 /// facing sides of its neighbors' boxes, which must already be shrunk in
 /// rows `y - 1` to `y + 1`. Interior nodes of the row have both horizontal
 /// neighbors, so only the two end nodes test for the left and right edges.
-fn pull_incoming_row<T: Copy>(
-    grid: &Grid<IncomingOverflowBoundGridNode<T>>,
-    incoming: &mut [Incoming],
+fn pull_halo_row<T: Copy>(
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
+    halo: &mut [Halo],
     y: usize,
 ) {
     let (cols, rows) = (grid.cols(), grid.rows());
     let vertical = [y != 0, y + 1 != rows];
-    let row = &mut incoming[y * cols..(y + 1) * cols];
+    let row = &mut halo[y * cols..(y + 1) * cols];
     let mut pull = |x: usize, horizontal: [bool; 2]| {
         // SAFETY: `y` is a row and `x` a column of `grid`, and the flags
         // state which neighbors the node lacks.
         unsafe {
-            *row.get_unchecked_mut(x) = Incoming::of_neighbors(grid, (x, y), horizontal, vertical);
+            *row.get_unchecked_mut(x) = Halo::of_neighbors(grid, (x, y), horizontal, vertical);
         }
     };
     if cols == 1 {
@@ -998,16 +1079,16 @@ fn pull_incoming_row<T: Copy>(
 }
 
 /// The box comes first, as every test of the node reads it; the node's
-/// copies live in the grid's `incoming` array.
+/// copies live in the grid's `halo` array.
 #[repr(C)]
-struct IncomingOverflowBoundGridNode<T: Copy> {
+struct HaloOverflowBoundGridNode<T: Copy> {
     /// Covers the bounds of every item in `items`; [`EMPTY`] while there are
     /// none.
     bounds: Rectangle,
     items: Vec<Entry<T>>,
 }
 
-impl<T: Copy> IncomingOverflowBoundGridNode<T> {
+impl<T: Copy> HaloOverflowBoundGridNode<T> {
     fn new() -> Self {
         Self {
             bounds: EMPTY,
@@ -1049,14 +1130,14 @@ impl<T: Copy> IncomingOverflowBoundGridNode<T> {
 /// unchanged, which is harmless since an item with one intersects no query.
 #[inline]
 fn cover(target: &mut Rectangle, bounds: &Rectangle) {
-    target.min_x = target.min_x.min(bounds.min_x);
-    target.min_y = target.min_y.min(bounds.min_y);
-    target.max_x = target.max_x.max(bounds.max_x);
-    target.max_y = target.max_y.max(bounds.max_y);
+    target.min_x = lower(target.min_x, bounds.min_x);
+    target.min_y = lower(target.min_y, bounds.min_y);
+    target.max_x = higher(target.max_x, bounds.max_x);
+    target.max_y = higher(target.max_y, bounds.max_y);
 }
 
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for IncomingOverflowBoundGrid<T, MAX_LEVEL> {}
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for IncomingOverflowBoundGrid<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for HaloOverflowBoundGrid<T, MAX_LEVEL> {}
+unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for HaloOverflowBoundGrid<T, MAX_LEVEL> {}
 
 #[cfg(test)]
 mod tests {
@@ -1064,13 +1145,61 @@ mod tests {
     use rand::prelude::*;
 
     const MAX_LEVEL: u8 = 7;
-    type Tree = IncomingOverflowBoundGrid<usize, MAX_LEVEL>;
+    type Tree = HaloOverflowBoundGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
         Rectangle::new(0.0, 0.0, 20000.0, 20000.0),
         Rectangle::new(0.3, -0.7, 1000.1, 333.3),
     ];
+    /// The update shortcut must place a center in the same cell as
+    /// `position`, also within a few floats of every cell edge, where
+    /// multiplying by the reciprocal of the node size and dividing by it can
+    /// round to different cells.
+    #[test]
+    fn update_shortcut_agrees_with_position_at_cell_edges() {
+        for world in WORLDS {
+            for tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
+                let origin = tree.root_bounds.get_min();
+                for level in 2..=MAX_LEVEL as usize {
+                    let geometry = &tree.geometry[level];
+                    let grid = &tree.layers[level];
+                    let (node_width, node_height) = (geometry.node_width, geometry.node_height);
+                    let inside = (origin.0 + node_width * 0.5, origin.1 + node_height * 0.5);
+                    let near = |edge: f64| {
+                        let mut points = vec![edge];
+                        let (mut up, mut down) = (edge, edge);
+                        for _ in 0..3 {
+                            up = up.next_up();
+                            down = down.next_down();
+                            points.extend([up, down]);
+                        }
+                        points
+                    };
+                    let mut centers = Vec::new();
+                    for i in 1..grid.cols() {
+                        for x in near(origin.0 + node_width * i as f64) {
+                            centers.push((x, inside.1));
+                        }
+                    }
+                    for i in 1..grid.rows() {
+                        for y in near(origin.1 + node_height * i as f64) {
+                            centers.push((inside.0, y));
+                        }
+                    }
+                    for center in centers {
+                        let cell = tree.cell_containing(level, center);
+                        let relative = (center.0 - origin.0, center.1 - origin.1);
+                        assert!(
+                            geometry.matches_cell(relative, cell),
+                            "world {world:?}, level {level}, center {center:?}, cell {cell:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
 
     /// Bounds of any size from the root down to below the finest node,
     /// centered anywhere in the root and therefore sometimes outside the
@@ -1096,7 +1225,7 @@ mod tests {
     }
 
     /// Union of the bounds of the items of `node`; `EMPTY` if it has none.
-    fn union<T: Copy>(node: &IncomingOverflowBoundGridNode<T>) -> Rectangle {
+    fn union<T: Copy>(node: &HaloOverflowBoundGridNode<T>) -> Rectangle {
         let side = |pick: fn(&Rectangle) -> f64, start: f64, fold: fn(f64, f64) -> f64| {
             node.items
                 .iter()
@@ -1282,7 +1411,7 @@ mod tests {
 
     /// Expected copies of every node of `level` right after a refresh,
     /// computed item by item from the neighbors, in storage order.
-    fn exact_incoming(tree: &Tree, level: usize) -> Vec<Incoming> {
+    fn exact_halo(tree: &Tree, level: usize) -> Vec<Halo> {
         let grid = &tree.layers[level];
         let (cols, rows) = (grid.cols(), grid.rows());
         let unions: Vec<Rectangle> = grid.iter().map(union).collect();
@@ -1304,7 +1433,7 @@ mod tests {
                 let top_right = union_at(x + 1, y - 1);
                 let bottom_left = union_at(x - 1, y + 1);
                 let bottom_right = union_at(x + 1, y + 1);
-                exact.push(Incoming {
+                exact.push(Halo {
                     left: left.max_x,
                     right: right.min_x,
                     top: top.max_y,
@@ -1320,7 +1449,7 @@ mod tests {
     }
 
     /// Whether `copies` reach at least as far as `exact` on every slot.
-    fn covers(copies: &Incoming, exact: &Incoming) -> bool {
+    fn covers(copies: &Halo, exact: &Halo) -> bool {
         copies.left >= exact.left
             && copies.right <= exact.right
             && copies.top >= exact.top
@@ -1340,7 +1469,7 @@ mod tests {
     /// boxes right after a refresh, which clears the level and row marks, and
     /// never change for the missing neighbors of an edge node.
     #[test]
-    fn incoming_covers_neighbors_until_refreshed() {
+    fn halo_covers_neighbors_until_refreshed() {
         exercise(5, |tree, step, refreshed| {
             for (level, grid) in tree.layers.iter().enumerate().skip(1) {
                 let (cols, rows) = (grid.cols(), grid.rows());
@@ -1354,8 +1483,8 @@ mod tests {
                         lines.row_touched
                     );
                 }
-                let exact = exact_incoming(tree, level);
-                let copies = &tree.incoming[level];
+                let exact = exact_halo(tree, level);
+                let copies = &tree.halo[level];
                 assert_eq!(copies.len(), cols * rows);
                 for (index, (copies, exact)) in copies.iter().zip(&exact).enumerate() {
                     let (x, y) = (index % cols, index / cols);
@@ -1366,7 +1495,7 @@ mod tests {
                     } else if !lines.near_touched(y) {
                         assert!(covers(copies, exact), "{context}");
                     }
-                    let initial = &NO_INCOMING;
+                    let initial = &NO_HALO;
                     if x == 0 {
                         assert_eq!(copies.left, initial.left, "{context}");
                         assert_eq!(copies.top_left, initial.top_left, "{context}");
@@ -1399,22 +1528,50 @@ mod tests {
             .unwrap_or(MAX_LEVEL as usize + 1)
     }
 
-    /// No level coarser than `coarsest_level` may ever hold items, and right
-    /// after a refresh it must be the coarsest level that does.
+    /// `coarsest_level()` must be the coarsest level below the root that holds
+    /// items after every insertion, update and removal, refreshed or not. With
+    /// at most nine items, levels keep emptying and filling again.
     #[test]
-    fn coarsest_level_never_passes_items() {
-        exercise(2, |tree, step, refreshed| {
-            let actual = coarsest_occupied(tree);
-            if refreshed {
-                assert_eq!(tree.coarsest_level, actual, "step {step}");
-            } else {
-                assert!(
-                    tree.coarsest_level <= actual,
-                    "step {step}: level {} is finer than {actual}",
-                    tree.coarsest_level
-                );
+    fn coarsest_level_follows_the_items() {
+        let mut rng = StdRng::seed_from_u64(5);
+        for world in WORLDS {
+            for mut tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
+                let root = tree.get_bounds().clone();
+                let mut handles: Vec<ItemHandle> = Vec::new();
+                let mut raised = 0;
+                for step in 0..3000 {
+                    let before = tree.coarsest_level();
+                    let operation = match handles.len() {
+                        0 | 1 => 0,
+                        9.. => 2,
+                        _ => rng.gen_range(0..3),
+                    };
+                    match operation {
+                        0 => {
+                            let bounds = random_bounds(&mut rng, &root);
+                            handles.push(tree.insert(bounds, step));
+                        }
+                        1 => {
+                            let bounds = random_bounds(&mut rng, &root);
+                            tree.update(bounds, handles[rng.gen_range(0..handles.len())]);
+                        }
+                        _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
+                    }
+                    assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
+                    raised += (tree.coarsest_level() > before) as usize;
+                    if rng.gen_bool(0.1) {
+                        tree.refresh_bounds();
+                        assert_eq!(
+                            tree.coarsest_level(),
+                            coarsest_occupied(&tree),
+                            "step {step}, refreshed"
+                        );
+                    }
+                }
+                // The coarsest level emptied out often enough to exercise clearing its bit.
+                assert!(raised > 100, "the coarsest level emptied only {raised} times");
             }
-        });
+        }
     }
 
     /// Storing an item marks its level touched and stale, taking one marks
@@ -1513,38 +1670,62 @@ mod tests {
         assert_eq!(near(&tree), [0, 1]);
     }
 
-    /// An item that grows or moves towards a neighboring node must be found
-    /// before the next refresh by a query centered in that neighbor, whose
-    /// copies do not reflect it yet.
+    /// An item that grows or moves towards any of the eight neighbors of its
+    /// node must be found before the next refresh by a query centered in
+    /// that neighbor, whose copies do not reflect it yet.
     #[test]
     fn item_reaching_into_a_neighbor_is_found_before_refresh() {
         let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
-        // Finest nodes are 16 units wide; (6, 6) spans 96..112 along x.
+        // Finest nodes are 16 units wide; (6, 6) spans 96..112.
         let home = Rectangle::center_rect(100.0, 100.0, 4.0, 4.0);
         let far = Rectangle::center_rect(500.0, 500.0, 4.0, 4.0);
-        // As wide as the node, centered near its right edge: 103..119.
-        let reaching = Rectangle::center_rect(111.0, 100.0, 16.0, 4.0);
-        let query = Rectangle::center_rect(116.0, 100.0, 2.0, 2.0);
         assert_eq!(tree.position(&home), (MAX_LEVEL as usize, 6, 6));
-        assert_eq!(tree.position(&reaching), (MAX_LEVEL as usize, 6, 6));
-        assert_eq!(tree.position(&query), (MAX_LEVEL as usize, 7, 6));
+        for dy in -1..=1isize {
+            for dx in -1..=1isize {
+                if (dx, dy) == (0, 0) {
+                    continue;
+                }
+                // As large as the node, centered 7 units from its center
+                // towards the neighbor, and so reaching 1 unit short of the
+                // neighbor's center: 103..119 for dx = 1, against 112..128.
+                let reaching = Rectangle::center_rect(
+                    104.0 + 7.0 * dx as f64,
+                    104.0 + 7.0 * dy as f64,
+                    16.0,
+                    16.0,
+                );
+                let query = Rectangle::center_rect(
+                    104.0 + 12.0 * dx as f64,
+                    104.0 + 12.0 * dy as f64,
+                    2.0,
+                    2.0,
+                );
+                let context = format!("towards ({dx}, {dy})");
+                assert_eq!(tree.position(&reaching), (MAX_LEVEL as usize, 6, 6), "{context}");
+                assert_eq!(
+                    tree.position(&query),
+                    (MAX_LEVEL as usize, (6 + dx) as usize, (6 + dy) as usize),
+                    "{context}"
+                );
 
-        // Grown within its node, or moved in from another node.
-        for before in [&home, &far] {
-            let mut found = Vec::new();
-            let handle = tree.insert(before.clone(), 0);
-            tree.refresh_bounds();
-            tree.search(&query, |id| found.push(id));
-            assert_eq!(found, [], "{before:?}");
-            tree.update(reaching.clone(), handle);
-            tree.search(&query, |id| found.push(id));
-            assert_eq!(found, [0], "from {before:?}");
-            tree.refresh_bounds();
-            found.clear();
-            tree.search(&query, |id| found.push(id));
-            assert_eq!(found, [0], "from {before:?}, refreshed");
-            tree.remove(handle);
-            tree.refresh_bounds();
+                // Grown within its node, or moved in from another node.
+                for before in [&home, &far] {
+                    let mut found = Vec::new();
+                    let handle = tree.insert(before.clone(), 0);
+                    tree.refresh_bounds();
+                    tree.search(&query, |id| found.push(id));
+                    assert_eq!(found, [], "{context}, {before:?}");
+                    tree.update(reaching.clone(), handle);
+                    tree.search(&query, |id| found.push(id));
+                    assert_eq!(found, [0], "{context}, from {before:?}");
+                    tree.refresh_bounds();
+                    found.clear();
+                    tree.search(&query, |id| found.push(id));
+                    assert_eq!(found, [0], "{context}, from {before:?}, refreshed");
+                    tree.remove(handle);
+                    tree.refresh_bounds();
+                }
+            }
         }
     }
 
@@ -1652,5 +1833,63 @@ mod tests {
 
         tree.remove(handle);
         assert_eq!(tree.layers[level][y][x].bounds, EMPTY);
+    }
+
+    /// Items with a NaN coordinate, which meet no query, go to the root. Their
+    /// other sides grow its box, but no side of it, nor of the spans of its
+    /// column and row, becomes NaN, whichever comes first and before and
+    /// after a refresh; the box therefore still meets queries, and searches
+    /// find the other items there. The root's spans are never read.
+    #[test]
+    fn nan_items_leave_the_root_box_to_the_others() {
+        // Centered outside the world, so stored in the root.
+        let outside = Rectangle::center_rect(-10.0, 100.0, 4.0, 4.0);
+        let nan = [
+            Rectangle::new(f64::NAN, 90.0, -5.0, 110.0),
+            Rectangle::new(-15.0, f64::NAN, f64::NAN, 102.0),
+            Rectangle::new(f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+        ];
+        let query = Rectangle::center_rect(-10.0, 100.0, 2.0, 2.0);
+        for nan_first in [true, false] {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let mut handles = Vec::new();
+            if nan_first {
+                handles.extend(nan.iter().map(|bounds| tree.insert(bounds.clone(), 1)));
+            }
+            tree.insert(outside.clone(), 0);
+            if !nan_first {
+                handles.extend(nan.iter().map(|bounds| tree.insert(bounds.clone(), 1)));
+            }
+            // Replaced in place by other NaN bounds.
+            tree.update(nan[2].clone(), handles[0]);
+            assert_eq!(tree.position(&outside), (1, 0, 0));
+            for refreshed in [false, true] {
+                if refreshed {
+                    tree.refresh_bounds();
+                }
+                let context = format!("NaN first {nan_first}, refreshed {refreshed}");
+                let root = &tree.layers[1][0][0].bounds;
+                let lines = &tree.lines[1];
+                let sides = [root.min_x, root.min_y, root.max_x, root.max_y];
+                let spans = [lines.columns[0], lines.rows[0]].concat();
+                assert!(!sides.iter().chain(&spans).any(|side| side.is_nan()), "{context}: {root:?}, {spans:?}");
+                // The sides the items have, as `f64::min` and `max` fold them.
+                let exact = union(&tree.layers[1][0][0]);
+                if refreshed {
+                    assert_eq!(*root, exact, "{context}");
+                } else {
+                    assert!(
+                        root.min_x <= exact.min_x
+                            && root.min_y <= exact.min_y
+                            && root.max_x >= exact.max_x
+                            && root.max_y >= exact.max_y,
+                        "{context}: {root:?} misses {exact:?}"
+                    );
+                }
+                let mut found = Vec::new();
+                tree.search(&query, |id| found.push(id));
+                assert_eq!(found, [0], "{context}");
+            }
+        }
     }
 }

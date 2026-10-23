@@ -6,6 +6,7 @@
 //! removes the reference from every cell of the old range, scanning each, and
 //! appends one to every cell of the new range.
 
+use crate::cell_order::for_each_cell_in_morton_order;
 use crate::handle::{ItemHandle, Slots};
 use crate::rect::Rectangle;
 
@@ -84,6 +85,16 @@ impl<T: Copy> UniformGrid<T> {
         self.cell_size
     }
 
+    /// Area covered by the cells, from the world's min corner over whole cells.
+    pub fn get_bounds(&self) -> Rectangle {
+        Rectangle::new(
+            self.origin_x,
+            self.origin_y,
+            self.origin_x + self.cols as f64 * self.cell_size,
+            self.origin_y + self.rows as f64 * self.cell_size,
+        )
+    }
+
     /// Cell containing a point. The cast saturates, so coordinates below the
     /// origin land in cell zero; `min` clamps the far side.
     #[inline]
@@ -112,6 +123,12 @@ impl<T: Copy> UniformGrid<T> {
         &mut self.cells[row + range.min_x as usize..=row + range.max_x as usize]
     }
 
+    /// Insert an item and return the handle that identifies it for
+    /// [`update`](Self::update) and [`remove`](Self::remove).
+    ///
+    /// Panics if the max x of `bounds` falls two or more columns before its
+    /// min x while its rows are in order, as for bounds inverted by more
+    /// than a cell or with a NaN max x, which lands in the first column.
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         let range = self.range_of(&bounds);
         let handle = self.slots.allocate(range);
@@ -134,6 +151,10 @@ impl<T: Copy> UniformGrid<T> {
     }
 
     /// Panics if the handle has already been removed.
+    ///
+    /// Panics if the max x of `bounds` falls two or more columns before its
+    /// min x while its rows are in order, as for bounds inverted by more
+    /// than a cell or with a NaN max x, which lands in the first column.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
         let old_range = self.slots.get(handle);
         let new_range = self.range_of(&bounds);
@@ -172,8 +193,41 @@ impl<T: Copy> UniformGrid<T> {
         }
     }
 
+    /// Search with the bounds of every stored item, as [`search`](Self::search)
+    /// would item by item, and call `callback` with the item searched for and
+    /// each item found, the searched one included. The objects are taken cell
+    /// by cell in Morton order, so that consecutive searches read nearby
+    /// cells, each from the first cell of its range only. It visits every
+    /// cell, so where cells far outnumber objects, searching item by item is
+    /// faster. Each search first reads its object's bounds from the object
+    /// table, which is in slot order, so the batch keeps only part of the gain
+    /// of the cell order. A one-off probe outside the repository, on balls
+    /// that all fit a cell, measured it 7% faster than searching item by
+    /// item in random order with 10,000 objects, where searching in Morton
+    /// order gains 14%, and 25% faster with 640,000 at the same density.
+    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
+        let cols = self.cols;
+        for_each_cell_in_morton_order(cols, self.rows, |x, y| {
+            for membership in &self.cells[y * cols + x] {
+                if membership.first_x as usize == x && membership.first_y as usize == y {
+                    let object = &self.objects[membership.object as usize];
+                    self.search(&object.bounds, |found| callback(object.item, found));
+                }
+            }
+        });
+    }
+
     /// Call `callback` once for every item whose bounds intersect `bounds`.
+    ///
+    /// Panics if the max x of `bounds` falls two or more columns before its
+    /// min x while its rows are in order, as for bounds inverted by more
+    /// than a cell.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        // A query with a NaN corner meets nothing; a NaN max x would land
+        // in the first column and could leave the range of a row inverted.
+        if bounds.has_nan() {
+            return;
+        }
         let range = self.range_of(bounds);
         for y in range.min_y..=range.max_y {
             let row = y as usize * self.cols;

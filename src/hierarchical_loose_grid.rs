@@ -1,5 +1,6 @@
+use crate::cell_order::for_each_cell_hierarchically;
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
-use crate::layer_geometry::LayerGeometry;
+use crate::layer_geometry::{LayerGeometry, half_node_corners, scan_range, size_level};
 use crate::rect::Rectangle;
 use grid::*;
 
@@ -18,6 +19,15 @@ pub struct HierarchicalLooseGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
+    /// Reciprocals of the node width and height, indexed by level. Position
+    /// and search multiply by them instead of dividing by the node size, and
+    /// `geometry` builds its cell edges with the same arithmetic.
+    inverse_node_size: Vec<(f64, f64)>,
+    /// Bit `L` is set while level `L` holds items: storing an item sets the
+    /// bit of its level, and taking the last item off a level clears it. The
+    /// coarsest level below the root that holds items, where the ancestor walk
+    /// of search stops, is therefore exact at all times.
+    occupied_levels: u64,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     /// Location of the entry of each live handle.
@@ -88,19 +98,30 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         };
 
         let mut geometry = Vec::with_capacity(layers.len());
-        geometry.push(LayerGeometry::default()); // Level zero is unused, like `layers[0]`.
+        let mut inverse_node_size = Vec::with_capacity(layers.len());
+        // Level zero is unused, like `layers[0]`.
+        geometry.push(LayerGeometry::default());
+        inverse_node_size.push((0.0, 0.0));
         for (level, grid) in layers.iter().enumerate().skip(1) {
-            geometry.push(LayerGeometry::new(
+            let (node_width, node_height) =
+                LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
+            let inverse = (1.0 / node_width, 1.0 / node_height);
+            geometry.push(LayerGeometry::with_reciprocal(
                 &root_bounds,
                 level,
                 grid.cols(),
                 grid.rows(),
+                inverse.0,
+                inverse.1,
             ));
+            inverse_node_size.push(inverse);
         }
 
         HierarchicalLooseGrid {
             layers,
             geometry,
+            inverse_node_size,
+            occupied_levels: 0,
             root_bounds,
             world_bounds,
             slots: Slots::new(),
@@ -131,27 +152,20 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
     /// but fewer than `2^L` times along the tighter axis, clamped to
     /// `1..=MAX_LEVEL`. [`LayerGeometry`] caches the matching size limits.
     fn level_for_size(&self, width: f64, height: f64) -> usize {
-        let multiple_x = (self.root_bounds.get_width() / width) as usize;
-        let multiple_y = (self.root_bounds.get_height() / height) as usize;
-
-        // Equivalent to:
-        // let multiple = multiple_x.min(multiple_y);
-        // let level = if multiple != 0 {
-        //     ((multiple.ilog2() + 1) as u8).min(MAX_LEVEL)
-        // } else {
-        //     1
-        // };
-        let level = usize::BITS - multiple_x.min(multiple_y).leading_zeros();
-        (level as usize).clamp(1, MAX_LEVEL as usize)
+        // The bit length of `(root / size) as usize` on each axis, from the
+        // exponents rather than by dividing.
+        let level_x = size_level(self.root_bounds.get_width(), width);
+        let level_y = size_level(self.root_bounds.get_height(), height);
+        level_x.min(level_y).clamp(1, MAX_LEVEL as i64) as usize
     }
 
     /// Cell of `level` whose area contains `point`, clamped into the grid.
     fn cell_containing(&self, level: usize, point: (f64, f64)) -> (usize, usize) {
         let grid = &self.layers[level];
-        let geometry = &self.geometry[level];
+        let (inverse_width, inverse_height) = self.inverse_node_size[level];
         let (origin_x, origin_y) = self.root_bounds.get_min();
-        let x = (((point.0 - origin_x) / geometry.node_width) as usize).min(grid.cols() - 1);
-        let y = (((point.1 - origin_y) / geometry.node_height) as usize).min(grid.rows() - 1);
+        let x = (((point.0 - origin_x) * inverse_width) as usize).min(grid.cols() - 1);
+        let y = (((point.1 - origin_y) * inverse_height) as usize).min(grid.rows() - 1);
         (x, y)
     }
 
@@ -175,7 +189,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
             item,
             handle,
         });
-        self.geometry[level].object_count += 1;
+        self.occupy(level);
         handle
     }
 
@@ -188,7 +202,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         let entry = self.take_entry(level, x, y, location.index as usize);
         debug_assert_eq!(entry.handle, handle);
         self.slots.free(handle);
-        self.geometry[level].object_count -= 1;
+        self.vacate(level);
     }
 
     /// Update the bounds of an item and, if necessary, its position in the grid.
@@ -215,8 +229,32 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         let new_node = &mut self.layers[nl][ny][nx];
         *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
         new_node.items.push(Entry { bounds, ..entry });
-        self.geometry[nl].object_count += 1;
+        self.occupy(nl);
+        self.vacate(level);
+    }
+
+    /// Count one more item on `level`.
+    fn occupy(&mut self, level: usize) {
+        self.geometry[level].object_count += 1;
+        self.occupied_levels |= 1 << level;
+    }
+
+    /// Count one item fewer on `level`, and clear its bit, without a branch,
+    /// if it is now empty. Keeping the coarsest level as a number instead,
+    /// with a branch and a scan for the next one when it empties, made
+    /// `reinsert` 5-9% slower than without it, beyond the 3% noise of that
+    /// bench, within which the bits stay.
+    fn vacate(&mut self, level: usize) {
         self.geometry[level].object_count -= 1;
+        let emptied = self.geometry[level].is_empty() as u64;
+        self.occupied_levels &= !(emptied << level);
+    }
+
+    /// The coarsest level below the root that holds items, or `MAX_LEVEL + 1`
+    /// if none does.
+    fn coarsest_level(&self) -> usize {
+        // Level zero is unused and the root is searched separately.
+        ((self.occupied_levels & !0b11).trailing_zeros() as usize).min(MAX_LEVEL as usize + 1)
     }
 
     /// Take the entry at `index` out of a node by swap removal. The entry that
@@ -237,8 +275,9 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
     /// Check cheaply whether `position` would still return `coord` for
     /// `bounds`.
     ///
-    /// The cached limits reproduce the division, truncation and clamp of
-    /// `position` exactly, so a resize within the same level also passes.
+    /// The cached limits reproduce the level arithmetic of `position` and its
+    /// multiplication by the reciprocal of the node size, truncation and
+    /// clamp exactly, so a resize within the same level also passes.
     /// Returns false on levels without the update shortcut and for degenerate
     /// sizes; the caller then falls back to `position`.
     fn stays_in_node(&self, bounds: &Rectangle, coord: Coord) -> bool {
@@ -257,55 +296,90 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
             && self.world_bounds.contains_point(center)
     }
 
+    /// Search with the bounds of every stored item, as [`search`](Self::search)
+    /// would item by item, and call `callback` with the item searched for and
+    /// each item found, the searched one included. The items are taken cell
+    /// by cell, depth first through the levels and in Morton order within
+    /// each, so that consecutive searches read nearby cells and the same
+    /// ancestors. The walk stops at the finest level that holds items but
+    /// visits every cell down to it, so where cells far outnumber items,
+    /// searching item by item is faster. On the search bench's distribution,
+    /// the `self_query` bench group measured it 15% faster than searching
+    /// item by item in random order with 10,000 items, and a one-off probe
+    /// outside the repository 42% with 640,000 items at the same
+    /// density, where the random order misses the cache.
+    pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for entry in &layers[level][y][x].items {
+                    self.search(&entry.bounds, |found| callback(entry.item, found));
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up, calling `callback` for each item found.
     ///
     /// The query's level follows from its size, as for an item. On each finer
     /// level, the range of nodes whose items may reach the query is computed
     /// from the query bounds and scanned, finest level first. From the query's
     /// level up to the root, the ancestor walk checks only the 3x3 block around
-    /// the query's cell and each of its ancestors. Neither part tests node
-    /// bounds.
+    /// the query's cell and each of its ancestors, skipping the levels between
+    /// the root and the coarsest level below it that holds items. Neither
+    /// part tests node bounds.
     ///
     /// Since levels are visited from the finest up, smaller items tend to be
     /// reported before larger ones; items within a level are not sorted by
     /// size.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
+        // Every comparison with NaN is false, so a query with a NaN corner
+        // meets nothing, while for a NaN minimum the scans would report the
+        // items of the nodes they take as inside it untested.
+        if bounds.has_nan() {
+            return;
+        }
         let max_level = MAX_LEVEL as usize;
         let level = self.level_for_size(bounds.get_width(), bounds.get_height());
         let (offset_x, offset_y) = self.root_bounds.get_min();
 
         let layers = &self.layers;
         if level != max_level {
-            // Top-left corner relative to the root origin.
-            let min_x = bounds.min_x - offset_x;
-            let min_y = bounds.min_y - offset_y;
-
-            // Bottom-right corner relative to the root origin.
-            let max_x = bounds.max_x - offset_x;
-            let max_y = bounds.max_y - offset_y;
-
-            let calc_min = |n: f64| (n.round() as usize).saturating_sub(1);
-            let calc_max = |n: f64| (n - 0.5).ceil() as usize;
+            // The query's corners relative to the root origin, in half nodes
+            // of the finest level; every level's scan range follows by shifts.
+            let half = half_node_corners(
+                [
+                    bounds.min_x - offset_x,
+                    bounds.min_y - offset_y,
+                    bounds.max_x - offset_x,
+                    bounds.max_y - offset_y,
+                ],
+                self.inverse_node_size[max_level],
+            );
 
             // Scanning every level this way, without the ancestor walk, is slower.
             layers[level + 1..=max_level]
                 .iter()
                 .zip(&self.geometry[level + 1..=max_level])
                 .rev()
-                .for_each(|(grid, geometry)| {
+                .enumerate()
+                .for_each(|(shift, (grid, geometry))| {
                     if geometry.is_empty() {
                         return;
                     }
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
-                    let node_width = geometry.node_width;
-                    let node_height = geometry.node_height;
 
-                    let min_coord_x = calc_min(min_x / node_width);
-                    let min_coord_y = calc_min(min_y / node_height);
-
-                    let max_coord_x = calc_max(max_x / node_width).min(grid_width - 1);
-                    let max_coord_y = calc_max(max_y / node_height).min(grid_height - 1);
+                    let [min_coord_x, min_coord_y, max_coord_x, max_coord_y] =
+                        scan_range(half, shift as u32, (grid_width - 1, grid_height - 1));
 
                     // Scan the resulting range.
                     for y in min_coord_y..=max_coord_y {
@@ -351,17 +425,36 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         let mut half_width = node_width * 0.5;
         let mut half_height = node_height * 0.5;
 
-        self.layers[2..=level]
+        // The root is searched last; levels coarser than `coarsest` hold nothing.
+        let coarsest = self.coarsest_level().min(level + 1);
+        // Steps to the parent cell: one between each two levels of the walk,
+        // none after the coarsest, whose parent the walk never reads, and none
+        // for an empty walk, where `coarsest` is `level + 1`. The step branches
+        // on the parity of the cell coordinates; skipping the unused last one
+        // made small balls 6-7% and small aligned queries 13-16% faster. A
+        // branch-free step with the same skip was 8-9% faster for the ball
+        // queries of the gap scene, which cross empty levels, but 2% slower on
+        // the mixed distribution and 3% slower in the batched self query.
+        let mut steps = level.saturating_sub(coarsest);
+        self.layers[coarsest..=level]
             .iter()
-            .zip(&self.geometry[2..=level])
+            .zip(&self.geometry[coarsest..=level])
             .rev()
             .for_each(|(grid, geometry)| unsafe {
                 if !geometry.is_empty() {
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
+                    // The unchecked reads below rely on the walk staying in the grid.
+                    debug_assert!(
+                        x < grid_width && y < grid_height,
+                        "walk cell ({x}, {y}) outside {grid_width}x{grid_height}"
+                    );
 
-                    if bounds.min_y < center_y && y != 0 {
-                        if bounds.min_x < center_x && x != 0 {
+                    // A query that starts or ends exactly on the center line
+                    // still meets an item whose bounds round a float past
+                    // it, so the tests include the line.
+                    if bounds.min_y <= center_y && y != 0 {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y - 1, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -371,14 +464,14 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x > center_x && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y - 1, x + 1);
                             node.search_items(bounds, callback);
                         }
                     }
 
                     {
-                        if bounds.min_x < center_x && x != 0 {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -388,14 +481,14 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x > center_x && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y, x + 1);
                             node.search_items(bounds, callback);
                         }
                     }
 
-                    if bounds.max_y > center_y && y + 1 != grid_height {
-                        if bounds.min_x < center_x && x != 0 {
+                    if bounds.max_y >= center_y && y + 1 != grid_height {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y + 1, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -405,12 +498,17 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x > center_x && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y + 1, x + 1);
                             node.search_items(bounds, callback);
                         }
                     }
                 }
+                // Ends only this level's call, like `continue`.
+                if steps == 0 {
+                    return;
+                }
+                steps -= 1;
                 // Advance to the parent cell, also on an empty level.
                 center_x += if x & 1 == 0 { half_width } else { -half_width };
                 center_y += if y & 1 == 0 {
@@ -649,6 +747,51 @@ mod tests {
         let reused = tree.insert(bounds.clone(), 1);
         assert_ne!(reused, stale);
         tree.update(bounds, stale);
+    }
+
+    /// Coarsest level below the root that holds items; `MAX_LEVEL + 1` if none
+    /// does.
+    fn coarsest_occupied(tree: &Tree) -> usize {
+        (2..=MAX_LEVEL as usize)
+            .find(|&level| !tree.geometry[level].is_empty())
+            .unwrap_or(MAX_LEVEL as usize + 1)
+    }
+
+    /// `coarsest_level()` must be the coarsest level below the root that holds
+    /// items after every insertion, update and removal. With at most nine
+    /// items, levels keep emptying and filling again.
+    #[test]
+    fn coarsest_level_follows_the_items() {
+        let mut rng = StdRng::seed_from_u64(5);
+        for mut tree in trees() {
+            let mut handles: Vec<ItemHandle> = Vec::new();
+            let mut raised = 0;
+            for step in 0..3000 {
+                let before = tree.coarsest_level();
+                let operation = match handles.len() {
+                    0 | 1 => 0,
+                    9.. => 2,
+                    _ => rng.gen_range(0..3),
+                };
+                match operation {
+                    0 => {
+                        let bounds = random_bounds(&mut rng, &tree);
+                        handles.push(tree.insert(bounds, step));
+                    }
+                    1 => {
+                        let bounds = random_bounds(&mut rng, &tree);
+                        tree.update(bounds, handles[rng.gen_range(0..handles.len())]);
+                    }
+                    _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
+                }
+                assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
+                if tree.coarsest_level() > before {
+                    raised += 1;
+                }
+            }
+            // The coarsest level emptied out often enough to exercise clearing its bit.
+            assert!(raised > 100, "the coarsest level emptied only {raised} times");
+        }
     }
 
     fn assert_consistent(tree: &Tree, handles: &[ItemHandle], bounds_of: &[Rectangle]) {

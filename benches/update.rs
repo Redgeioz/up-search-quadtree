@@ -106,7 +106,7 @@ impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for BoxedOverflowBoundGrid<T, MAX_LE
 }
 
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for StripedOverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for SpanOverflowBoundGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         self.insert(bounds, item)
     }
@@ -121,7 +121,7 @@ impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for StripedOverflowBoundGrid<T, MAX_
     }
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for IncomingOverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for HaloOverflowBoundGrid<T, MAX_LEVEL> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         self.insert(bounds, item)
     }
@@ -160,7 +160,22 @@ impl<T: Copy, const MAX_LEVEL: u8> QTree<T> for HierarchicalGrid<T, MAX_LEVEL> {
     }
 }
 
-impl<T: Copy> QTree<T> for StripedGrid<T> {
+impl<T: Copy> QTree<T> for SpanGrid<T> {
+    fn insert_item(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
+        self.insert(bounds, item)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.remove(handle);
+    }
+    fn end_frame(&mut self) {
+        self.refresh_bounds();
+    }
+}
+
+impl<T: Copy> QTree<T> for HaloGrid<T> {
     fn insert_item(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         self.insert(bounds, item)
     }
@@ -273,18 +288,23 @@ fn update(c: &mut Criterion) {
     );
     bench_update(
         &mut group,
-        "StripedOverflowBoundGrid",
-        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        "SpanOverflowBoundGrid",
+        SpanOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
     );
     bench_update(
         &mut group,
-        "IncomingOverflowBoundGrid",
-        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        "HaloOverflowBoundGrid",
+        HaloOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
     );
     bench_update(
         &mut group,
-        "StripedGrid",
-        StripedGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+        "SpanGrid",
+        SpanGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+    );
+    bench_update(
+        &mut group,
+        "HaloGrid",
+        HaloGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
     );
     bench_update(
         &mut group,
@@ -328,18 +348,23 @@ fn reinsert(c: &mut Criterion) {
     );
     bench_reinsert(
         &mut group,
-        "StripedOverflowBoundGrid",
-        StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        "SpanOverflowBoundGrid",
+        SpanOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
     );
     bench_reinsert(
         &mut group,
-        "IncomingOverflowBoundGrid",
-        IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+        "HaloOverflowBoundGrid",
+        HaloOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
     );
     bench_reinsert(
         &mut group,
-        "StripedGrid",
-        StripedGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+        "SpanGrid",
+        SpanGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+    );
+    bench_reinsert(
+        &mut group,
+        "HaloGrid",
+        HaloGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
     );
     bench_reinsert(
         &mut group,
@@ -465,15 +490,15 @@ fn update_compare(c: &mut Criterion) {
         );
         bench_update_pair(
             &mut group,
-            &format!("{scenario}/StripedOverflowBoundGrid"),
-            StripedOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+            &format!("{scenario}/SpanOverflowBoundGrid"),
+            SpanOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
             &from,
             to,
         );
         bench_update_pair(
             &mut group,
-            &format!("{scenario}/IncomingOverflowBoundGrid"),
-            IncomingOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
+            &format!("{scenario}/HaloOverflowBoundGrid"),
+            HaloOverflowBoundGrid::<usize, MAX_LEVEL>::new(BOUNDS.clone()),
             &from,
             to,
         );
@@ -486,8 +511,15 @@ fn update_compare(c: &mut Criterion) {
         );
         bench_update_pair(
             &mut group,
-            &format!("{scenario}/StripedGrid"),
-            StripedGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+            &format!("{scenario}/SpanGrid"),
+            SpanGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
+            &from,
+            to,
+        );
+        bench_update_pair(
+            &mut group,
+            &format!("{scenario}/HaloGrid"),
+            HaloGrid::<usize>::new(BOUNDS.clone(), GRID_CELL_SIZE),
             &from,
             to,
         );

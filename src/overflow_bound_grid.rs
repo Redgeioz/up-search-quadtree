@@ -1,7 +1,9 @@
 use crate::bitmap_max_multiset::MaxMultiset;
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
-use crate::layer_geometry::{LayerGeometry, first_reaching_node, last_reaching_node, size_level};
+use crate::layer_geometry::{
+    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
+};
 use crate::overflow_bound::rounding_slack;
 use crate::rect::Rectangle;
 use grid::*;
@@ -157,71 +159,12 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
     }
 
     fn create<const FIT: bool>(world_bounds: Rectangle) -> OverflowBoundGrid<T, MAX_LEVEL> {
-        assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
-        let n = 1usize
-            .checked_shl((MAX_LEVEL - 1) as u32)
-            .expect("`MAX_LEVEL` is too large and will cause overflow.");
-        assert!(
-            n.checked_mul(n).is_some(),
-            "`MAX_LEVEL` is too large and will cause overflow."
-        );
-
-        let world_width = world_bounds.get_width();
-        let world_height = world_bounds.get_height();
-
-        // One grid per level; level zero has no cells.
-        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
-        let mut size = 0;
-        for n in 0..=MAX_LEVEL {
-            let (mut rows, mut cols) = (size, size);
-            if !FIT {
-                if world_width > world_height {
-                    rows = (size as f64 * world_height / world_width).ceil() as usize;
-                } else if world_height > world_width {
-                    cols = (size as f64 / world_height * world_width).ceil() as usize;
-                }
-            }
-            let mut vec = Vec::with_capacity(rows * cols);
-            for _ in 0..rows {
-                for _ in 0..cols {
-                    vec.push(OverflowBoundGridNode::new());
-                }
-            }
-            layers.push(Grid::from_vec(vec, cols));
-            size = 1 << n;
-        }
-
-        // Root bounds: unless fitted, a square from the world's minimum corner.
-        let root_bounds = if !FIT {
-            let len = world_width.max(world_height);
-            let root_width = len;
-            let root_height = len;
-
-            let (min_x, min_y) = world_bounds.get_min();
-            let center_x = min_x + len * 0.5;
-            let center_y = min_y + len * 0.5;
-            Rectangle::center_rect(center_x, center_y, root_width, root_height)
-        } else {
-            world_bounds.clone()
-        };
-
-        let mut geometry = Vec::with_capacity(layers.len());
-        let mut inverse_node_size = vec![(0.0, 0.0)]; // Level zero is unused.
-        geometry.push(LayerGeometry::default()); // Level zero is unused, like `layers[0]`.
-        for (level, grid) in layers.iter().enumerate().skip(1) {
-            let (node_width, node_height) =
-                LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
-            let inverse = (1.0 / node_width, 1.0 / node_height);
-            geometry.push(LayerGeometry::with_reciprocal(
-                &root_bounds,
-                level,
-                grid.cols(),
-                grid.rows(),
-                inverse.0,
-                inverse.1,
-            ));
-            inverse_node_size.push(inverse);
-        }
+        let Levels {
+            layers,
+            root_bounds,
+            geometry,
+            inverse_node_size,
+        } = build_levels::<_, FIT>(&world_bounds, MAX_LEVEL, OverflowBoundGridNode::new);
 
         let slack = rounding_slack(&root_bounds);
 
@@ -714,7 +657,6 @@ mod tests {
     use crate::bitmap_max_multiset::key_of;
     use rand::prelude::*;
     use std::collections::BTreeMap;
-    use std::ops::Range;
 
     /// Maxima of a level without items.
     const NOWHERE: DirectionalOverflow = DirectionalOverflow {
@@ -733,122 +675,7 @@ mod tests {
         Rectangle::new(0.3, -0.7, 1000.1, 333.3),
     ];
 
-    fn trees() -> Vec<Tree> {
-        WORLDS
-            .iter()
-            .flat_map(|world| [Tree::new(world.clone()), Tree::new_fit(world.clone())])
-            .collect()
-    }
-
-    /// Move `value` a few floats up or down, onto either side of a boundary.
-    fn jitter(rng: &mut StdRng, mut value: f64) -> f64 {
-        for _ in 0..rng.gen_range(0..4) {
-            value = if rng.gen_bool(0.5) {
-                value.next_up()
-            } else {
-                value.next_down()
-            };
-        }
-        value
-    }
-
-    /// Jitter around one of `candidates`, or fall back to a uniform value.
-    fn near_one_of(rng: &mut StdRng, candidates: &[f64], fallback: Range<f64>) -> f64 {
-        if candidates.is_empty() || rng.gen_bool(0.3) {
-            rng.gen_range(fallback)
-        } else {
-            let candidate = candidates[rng.gen_range(0..candidates.len())];
-            jitter(rng, candidate)
-        }
-    }
-
-    /// Random bounds biased towards the size limits and cell edges of a random
-    /// level, where `position` and the cached geometry most likely disagree.
-    fn random_bounds(rng: &mut StdRng, tree: &Tree) -> Rectangle {
-        let root = tree.get_bounds();
-        let world = &tree.world_bounds;
-        let geometry = &tree.geometry[rng.gen_range(1..=MAX_LEVEL as usize)];
-
-        // The node size is the size limit of the level; half of it is that of
-        // the next finer level.
-        let size_limits = |node_size: f64| -> Vec<f64> {
-            if geometry.has_update_shortcut() {
-                vec![node_size, node_size * 0.5]
-            } else {
-                Vec::new()
-            }
-        };
-        let width_limits = size_limits(geometry.node_width);
-        let height_limits = size_limits(geometry.node_height);
-        let width = near_one_of(rng, &width_limits, 0.0..root.get_width() * 1.1);
-        let height = near_one_of(rng, &height_limits, 0.0..root.get_height() * 1.1);
-
-        // Only the inner edges are finite; the outer ones are +-infinity.
-        let inner_edges = |edges: &[f64], origin: f64| -> Vec<f64> {
-            edges
-                .get(1..edges.len().saturating_sub(1))
-                .unwrap_or(&[])
-                .iter()
-                .map(|edge| origin + edge)
-                .collect()
-        };
-        let x_edges = inner_edges(&geometry.cell_x_edges, root.min_x);
-        let y_edges = inner_edges(&geometry.cell_y_edges, root.min_y);
-        let pad_x = world.get_width() * 0.05;
-        let pad_y = world.get_height() * 0.05;
-        let center_x = near_one_of(rng, &x_edges, world.min_x - pad_x..world.max_x + pad_x);
-        let center_y = near_one_of(rng, &y_edges, world.min_y - pad_y..world.max_y + pad_y);
-
-        Rectangle::center_rect(center_x, center_y, width, height)
-    }
-
-    /// The update shortcut must agree with `position` exactly. A false positive
-    /// would leave an item in the wrong node; a false negative would only cost
-    /// time, but the cached limits are meant to be exact.
-    #[test]
-    fn update_shortcut_agrees_with_position() {
-        let mut rng = StdRng::seed_from_u64(0);
-        for tree in trees() {
-            for _ in 0..100_000 {
-                let bounds = random_bounds(&mut rng, &tree);
-                let coord @ (level, x, y) = tree.position(&bounds);
-
-                // Degenerate sizes intentionally bypass the shortcut.
-                let is_degenerate = bounds.get_width() <= 0.0 || bounds.get_height() <= 0.0;
-                if tree.geometry[level].has_update_shortcut() && !is_degenerate {
-                    assert!(
-                        tree.stays_in_node(&bounds, coord),
-                        "false negative for {bounds:?} at {coord:?}"
-                    );
-                }
-
-                // Neighboring cells on the same level must be rejected.
-                let grid = &tree.layers[level];
-                for dy in -1..=1isize {
-                    for dx in -1..=1isize {
-                        let (nx, ny) = (x.wrapping_add_signed(dx), y.wrapping_add_signed(dy));
-                        if (dx, dy) != (0, 0) && nx < grid.cols() && ny < grid.rows() {
-                            assert!(
-                                !tree.stays_in_node(&bounds, (level, nx, ny)),
-                                "false positive for {bounds:?} at ({level}, {nx}, {ny})"
-                            );
-                        }
-                    }
-                }
-
-                // The containing cell on an adjacent level must be rejected too.
-                for other_level in [level - 1, level + 1] {
-                    if (1..=MAX_LEVEL as usize).contains(&other_level) {
-                        let (ox, oy) = tree.cell_containing(other_level, bounds.get_center());
-                        assert!(
-                            !tree.stays_in_node(&bounds, (other_level, ox, oy)),
-                            "false positive for {bounds:?} at ({other_level}, {ox}, {oy})"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    crate::grid_tests::exact_reach_tests!();
 
     /// Moves and resizes through `update` must keep every slot and per-level
     /// object count consistent with `position`, also after removals and the
@@ -904,64 +731,6 @@ mod tests {
             }
             assert_eq!(tree.slots.slot_count(), 500);
             assert_consistent(&tree, &handles, &bounds_of);
-        }
-    }
-
-    /// A removed handle must be rejected even after its slot has been reused.
-    #[test]
-    #[should_panic(expected = "has been removed")]
-    fn stale_handle_is_rejected() {
-        let mut tree = Tree::new(WORLDS[0].clone());
-        let bounds = Rectangle::center_rect(100.0, 100.0, 10.0, 10.0);
-        let stale = tree.insert(bounds.clone(), 0);
-        tree.remove(stale);
-        let reused = tree.insert(bounds.clone(), 1);
-        assert_ne!(reused, stale);
-        tree.update(bounds, stale);
-    }
-
-    /// Coarsest level below the root that holds items; `MAX_LEVEL + 1` if none
-    /// does.
-    fn coarsest_occupied(tree: &Tree) -> usize {
-        (2..=MAX_LEVEL as usize)
-            .find(|&level| !tree.geometry[level].is_empty())
-            .unwrap_or(MAX_LEVEL as usize + 1)
-    }
-
-    /// `coarsest_level()` must be the coarsest level below the root that holds
-    /// items after every insertion, update and removal. With at most nine
-    /// items, levels keep emptying and filling again.
-    #[test]
-    fn coarsest_level_follows_the_items() {
-        let mut rng = StdRng::seed_from_u64(5);
-        for mut tree in trees() {
-            let mut handles: Vec<ItemHandle> = Vec::new();
-            let mut raised = 0;
-            for step in 0..3000 {
-                let before = tree.coarsest_level();
-                let operation = match handles.len() {
-                    0 | 1 => 0,
-                    9.. => 2,
-                    _ => rng.gen_range(0..3),
-                };
-                match operation {
-                    0 => {
-                        let bounds = random_bounds(&mut rng, &tree);
-                        handles.push(tree.insert(bounds, step));
-                    }
-                    1 => {
-                        let bounds = random_bounds(&mut rng, &tree);
-                        tree.update(bounds, handles[rng.gen_range(0..handles.len())]);
-                    }
-                    _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
-                }
-                assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
-                if tree.coarsest_level() > before {
-                    raised += 1;
-                }
-            }
-            // The coarsest level emptied out often enough to exercise clearing its bit.
-            assert!(raised > 100, "the coarsest level emptied only {raised} times");
         }
     }
 

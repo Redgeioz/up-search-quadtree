@@ -98,3 +98,16 @@ impl Rectangle {
         self.min_x.is_nan() | self.min_y.is_nan() | self.max_x.is_nan() | self.max_y.is_nan()
     }
 }
+
+/// Box of a node without items. Every comparison of [`Rectangle::intersects`]
+/// fails against it, so it meets no query, and growing it by a box gives that
+/// box.
+pub(crate) const EMPTY: Rectangle = Rectangle::new(
+    f64::INFINITY,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NEG_INFINITY,
+);
+
+/// Span of a line without items, which meets no query.
+pub(crate) const NOWHERE: [f64; 2] = [f64::INFINITY, f64::NEG_INFINITY];

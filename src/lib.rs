@@ -18,6 +18,8 @@ pub mod span_overflow_bound_grid;
 pub mod uniform_grid;
 
 #[cfg(test)]
+mod grid_tests;
+#[cfg(test)]
 pub mod test;
 
 pub use boxed_overflow_bound_grid::*;

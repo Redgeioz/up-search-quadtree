@@ -26,8 +26,10 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
     pub fn create<const FIT: bool>(
         world_bounds: Rectangle,
     ) -> LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS> {
-        let n = 1usize << (MAX_LEVEL - 1);
         assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
+        let n = 1usize
+            .checked_shl((MAX_LEVEL - 1) as u32)
+            .expect("`MAX_LEVEL` is too large and will cause overflow.");
         assert!(
             n.checked_mul(n).is_some(),
             "`MAX_LEVEL` is too large and will cause overflow."
@@ -278,9 +280,18 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         });
 
         self.children = Some(Box::new(children));
+        // `insert` sends an item to the child whose quadrant holds its center,
+        // and that child's loose bounds cover the item only if the center lies
+        // in this node's unloosened area. Only the root holds items centered
+        // elsewhere (outside the world); they stay here.
+        let area = self.loose_bounds.scale(0.5);
         let items = std::mem::replace(&mut self.items, Vec::with_capacity(MAX_ITEMS));
         items.into_iter().for_each(|entry| {
-            self.insert(entry, slots);
+            if area.contains_point(entry.bounds.get_center()) {
+                self.insert(entry, slots);
+            } else {
+                self.add(entry, slots);
+            }
         });
     }
 
@@ -353,11 +364,13 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
     }
 }
 
-unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
+// The parent and slot pointers only point into the tree's own nodes, so the
+// tree is as safe to send or share as its items.
+unsafe impl<T: Copy + Send, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Send
     for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }
-unsafe impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
+unsafe impl<T: Copy + Sync, const MAX_LEVEL: u8, const MAX_ITEMS: usize> Sync
     for LooseQuadTree<T, MAX_LEVEL, MAX_ITEMS>
 {
 }

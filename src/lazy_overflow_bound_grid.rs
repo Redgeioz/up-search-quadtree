@@ -1,6 +1,8 @@
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::cell_order::for_each_cell_hierarchically;
-use crate::layer_geometry::{LayerGeometry, first_reaching_node, last_reaching_node, size_level};
+use crate::layer_geometry::{
+    LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
+};
 use crate::overflow_bound_grid::DirectionalOverflow;
 use crate::overflow_bound::{LevelReach, cell_overflow, rounding_slack};
 use crate::rect::Rectangle;
@@ -76,69 +78,12 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
     }
 
     fn create<const FIT: bool>(world_bounds: Rectangle) -> LazyOverflowBoundGrid<T, MAX_LEVEL> {
-        let n = 1usize << (MAX_LEVEL - 1);
-        assert!(MAX_LEVEL as usize > 0, "`MAX_LEVEL` cannot be zero.");
-        assert!(
-            n.checked_mul(n).is_some(),
-            "`MAX_LEVEL` is too large and will cause overflow."
-        );
-
-        let world_width = world_bounds.get_width();
-        let world_height = world_bounds.get_height();
-
-        // Initialize the layers.
-        let mut layers = Vec::with_capacity(MAX_LEVEL as usize + 1);
-        let mut size = 0;
-        for n in 0..=MAX_LEVEL {
-            let (mut rows, mut cols) = (size, size);
-            if !FIT {
-                if world_width > world_height {
-                    rows = (size as f64 * world_height / world_width).ceil() as usize;
-                } else if world_height > world_width {
-                    cols = (size as f64 / world_height * world_width).ceil() as usize;
-                }
-            }
-            let mut vec = Vec::with_capacity(rows * cols);
-            for _ in 0..rows {
-                for _ in 0..cols {
-                    vec.push(LazyOverflowBoundGridNode::new());
-                }
-            }
-            layers.push(Grid::from_vec(vec, cols));
-            size = 1 << n;
-        }
-
-        // Determine the root bounds.
-        let root_bounds = if !FIT {
-            let len = world_width.max(world_height);
-            let root_width = len;
-            let root_height = len;
-
-            let (min_x, min_y) = world_bounds.get_min();
-            let center_x = min_x + len * 0.5;
-            let center_y = min_y + len * 0.5;
-            Rectangle::center_rect(center_x, center_y, root_width, root_height)
-        } else {
-            world_bounds.clone()
-        };
-
-        let mut geometry = Vec::with_capacity(layers.len());
-        let mut inverse_node_size = vec![(0.0, 0.0)]; // Level zero is unused.
-        geometry.push(LayerGeometry::default()); // Level zero is unused, like `layers[0]`.
-        for (level, grid) in layers.iter().enumerate().skip(1) {
-            let (node_width, node_height) =
-                LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
-            let inverse = (1.0 / node_width, 1.0 / node_height);
-            geometry.push(LayerGeometry::with_reciprocal(
-                &root_bounds,
-                level,
-                grid.cols(),
-                grid.rows(),
-                inverse.0,
-                inverse.1,
-            ));
-            inverse_node_size.push(inverse);
-        }
+        let Levels {
+            layers,
+            root_bounds,
+            geometry,
+            inverse_node_size,
+        } = build_levels::<_, FIT>(&world_bounds, MAX_LEVEL, LazyOverflowBoundGridNode::new);
 
         let slack = rounding_slack(&root_bounds);
 
@@ -629,9 +574,6 @@ impl<T: Copy> LazyOverflowBoundGridNode<T> {
     }
 }
 
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Send for LazyOverflowBoundGrid<T, MAX_LEVEL> {}
-unsafe impl<T: Copy, const MAX_LEVEL: u8> Sync for LazyOverflowBoundGrid<T, MAX_LEVEL> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,64 +587,8 @@ mod tests {
         Rectangle::new(0.0, 0.0, 20000.0, 20000.0),
         Rectangle::new(0.3, -0.7, 1000.1, 333.3),
     ];
-    /// The update shortcut must place a center in the same cell as
-    /// `position`, also within a few floats of every cell edge, where
-    /// multiplying by the reciprocal of the node size and dividing by it can
-    /// round to different cells.
-    #[test]
-    fn update_shortcut_agrees_with_position_at_cell_edges() {
-        for world in WORLDS {
-            for tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
-                let origin = tree.root_bounds.get_min();
-                for level in 2..=MAX_LEVEL as usize {
-                    let geometry = &tree.geometry[level];
-                    let grid = &tree.layers[level];
-                    let (node_width, node_height) = (geometry.node_width, geometry.node_height);
-                    let inside = (origin.0 + node_width * 0.5, origin.1 + node_height * 0.5);
-                    let near = |edge: f64| {
-                        let mut points = vec![edge];
-                        let (mut up, mut down) = (edge, edge);
-                        for _ in 0..3 {
-                            up = up.next_up();
-                            down = down.next_down();
-                            points.extend([up, down]);
-                        }
-                        points
-                    };
-                    let mut centers = Vec::new();
-                    for i in 1..grid.cols() {
-                        for x in near(origin.0 + node_width * i as f64) {
-                            centers.push((x, inside.1));
-                        }
-                    }
-                    for i in 1..grid.rows() {
-                        for y in near(origin.1 + node_height * i as f64) {
-                            centers.push((inside.0, y));
-                        }
-                    }
-                    for center in centers {
-                        let cell = tree.cell_containing(level, center);
-                        let relative = (center.0 - origin.0, center.1 - origin.1);
-                        assert!(
-                            geometry.matches_cell(relative, cell),
-                            "world {world:?}, level {level}, center {center:?}, cell {cell:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
 
-
-    /// Bounds of any size from the root down to below the finest node, centered
-    /// anywhere in the root and therefore sometimes outside the world.
-    fn random_bounds(rng: &mut StdRng, root: &Rectangle) -> Rectangle {
-        let scale = 2f64.powf(-rng.gen_range(0.0..MAX_LEVEL as f64 + 2.0));
-        let width = root.get_width() * scale * rng.gen_range(0.5..1.0);
-        let height = root.get_height() * scale * rng.gen_range(0.5..1.0);
-        let (x, y) = root.get_random_point(rng);
-        Rectangle::center_rect(x, y, width, height)
-    }
+    crate::grid_tests::lazy_bound_tests!();
 
     /// A small move that usually keeps the item in its node but changes its
     /// overflow.
@@ -735,10 +621,6 @@ mod tests {
             }
         }
         largest
-    }
-
-    fn directions(bound: DirectionalOverflow) -> [f64; 4] {
-        [bound.left, bound.right, bound.top, bound.bottom]
     }
 
     /// Between refreshes, every bound must cover the overflow of every item on
@@ -823,141 +705,5 @@ mod tests {
         // The remaining item stays 7 units inside the left edge of its node.
         tree.refresh_bounds();
         assert_eq!(tree.overflow_bound(level).left, -7.0);
-    }
-
-    /// Coarsest level below the root that holds items; `MAX_LEVEL + 1` if none
-    /// does.
-    fn coarsest_occupied(tree: &Tree) -> usize {
-        (2..=MAX_LEVEL as usize)
-            .find(|&level| !tree.geometry[level].is_empty())
-            .unwrap_or(MAX_LEVEL as usize + 1)
-    }
-
-    /// `coarsest_level()` must be the coarsest level below the root that holds
-    /// items after every insertion, update and removal, refreshed or not. With
-    /// at most nine items, levels keep emptying and filling again.
-    #[test]
-    fn coarsest_level_follows_the_items() {
-        let mut rng = StdRng::seed_from_u64(5);
-        for world in WORLDS {
-            for mut tree in [Tree::new(world.clone()), Tree::new_fit(world.clone())] {
-                let root = tree.get_bounds().clone();
-                let mut handles: Vec<ItemHandle> = Vec::new();
-                let mut raised = 0;
-                for step in 0..3000 {
-                    let before = tree.coarsest_level();
-                    let operation = match handles.len() {
-                        0 | 1 => 0,
-                        9.. => 2,
-                        _ => rng.gen_range(0..3),
-                    };
-                    match operation {
-                        0 => {
-                            let bounds = random_bounds(&mut rng, &root);
-                            handles.push(tree.insert(bounds, step));
-                        }
-                        1 => {
-                            let bounds = random_bounds(&mut rng, &root);
-                            tree.update(bounds, handles[rng.gen_range(0..handles.len())]);
-                        }
-                        _ => tree.remove(handles.swap_remove(rng.gen_range(0..handles.len()))),
-                    }
-                    assert_eq!(tree.coarsest_level(), coarsest_occupied(&tree), "step {step}");
-                    raised += (tree.coarsest_level() > before) as usize;
-                    if rng.gen_bool(0.1) {
-                        tree.refresh_bounds();
-                        assert_eq!(
-                            tree.coarsest_level(),
-                            coarsest_occupied(&tree),
-                            "step {step}, refreshed"
-                        );
-                    }
-                }
-                // The coarsest level emptied out often enough to exercise clearing its bit.
-                assert!(raised > 100, "the coarsest level emptied only {raised} times");
-            }
-        }
-    }
-
-    /// An item that grows into a level coarser than any other must be found
-    /// before the next refresh, including by queries on the finest level.
-    #[test]
-    fn item_moved_to_a_coarser_level_is_found_before_refresh() {
-        let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
-        let handle = tree.insert(Rectangle::center_rect(100.0, 100.0, 4.0, 4.0), 0);
-        tree.refresh_bounds();
-
-        let big = Rectangle::center_rect(100.0, 100.0, 200.0, 200.0);
-        tree.update(big.clone(), handle);
-        assert!(tree.position(&big).0 < MAX_LEVEL as usize);
-
-        let query = Rectangle::center_rect(150.0, 150.0, 2.0, 2.0);
-        assert_eq!(tree.position(&query).0, MAX_LEVEL as usize);
-        let mut found = Vec::new();
-        tree.search(&query, |id| found.push(id));
-        assert_eq!(found, vec![0]);
-    }
-
-    /// Items that stay inside their cell edges yield negative bounds, before
-    /// and after a refresh. Search must still return exactly the intersecting
-    /// items, including those that overlap a query by a single ulp.
-    #[test]
-    fn negative_level_bounds_keep_searches_exact() {
-        let mut rng = StdRng::seed_from_u64(3);
-        let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
-        // The finest nodes are 16 units wide; every item stays at least 1.5
-        // units inside its node.
-        let mut items = Vec::new();
-        for y in 0..64 {
-            for x in 0..64 {
-                let cx = (x as f64 + 0.5) * 16.0 + rng.gen_range(-2.0..2.0);
-                let cy = (y as f64 + 0.5) * 16.0 + rng.gen_range(-2.0..2.0);
-                let (width, height) = (rng.gen_range(3.0..9.0), rng.gen_range(3.0..9.0));
-                let bounds = Rectangle::center_rect(cx, cy, width, height);
-                tree.insert(bounds.clone(), items.len());
-                items.push(bounds);
-            }
-        }
-
-        for refreshed in [false, true] {
-            if refreshed {
-                tree.refresh_bounds();
-            }
-            let bound = directions(tree.overflow_bound(MAX_LEVEL as usize));
-            assert!(
-                bound.iter().all(|&reach| reach < -1.0),
-                "refreshed {refreshed}: {bound:?}"
-            );
-            for round in 0..3000 {
-                let query = if round % 2 == 0 {
-                    let (x, y) = (rng.gen_range(-20.0..1044.0), rng.gen_range(-20.0..1044.0));
-                    let scale = [0.5, 4.0, 16.0, 64.0][rng.gen_range(0..4)];
-                    let (width, height) = (
-                        scale * rng.gen_range(0.5..2.0),
-                        scale * rng.gen_range(0.5..2.0),
-                    );
-                    Rectangle::center_rect(x, y, width, height)
-                } else {
-                    let b = &items[rng.gen_range(0..items.len())];
-                    let width = b.get_width() * rng.gen_range(0.1..8.0);
-                    let height = b.get_height() * rng.gen_range(0.1..8.0);
-                    match rng.gen_range(0..4) {
-                        0 => Rectangle::new(b.max_x.next_down(), b.min_y, b.max_x + width, b.max_y),
-                        1 => Rectangle::new(b.min_x - width, b.min_y, b.min_x.next_up(), b.max_y),
-                        2 => {
-                            Rectangle::new(b.min_x, b.max_y.next_down(), b.max_x, b.max_y + height)
-                        }
-                        _ => Rectangle::new(b.min_x, b.min_y - height, b.max_x, b.min_y.next_up()),
-                    }
-                };
-                let expected: Vec<usize> = (0..items.len())
-                    .filter(|&i| items[i].intersects(&query))
-                    .collect();
-                let mut found = Vec::new();
-                tree.search(&query, |id| found.push(id));
-                found.sort_unstable();
-                assert_eq!(found, expected, "refreshed {refreshed}, query {query:?}");
-            }
-        }
     }
 }

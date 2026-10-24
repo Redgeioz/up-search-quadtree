@@ -3,6 +3,7 @@
 //! without repeating the positioning arithmetic.
 
 use crate::rect::Rectangle;
+use grid::Grid;
 
 /// Per-level constants derived from the root bounds, plus the number of
 /// objects currently stored on the level.
@@ -183,6 +184,91 @@ impl LayerGeometry {
         }
         edges.push(f64::INFINITY); // The last cell clamps all larger coordinates.
         edges.into_boxed_slice()
+    }
+}
+
+/// The levels of a multi-level grid, from level zero, which is unused and has
+/// no cells, to `max_level`; level `L` has at most `2^(L - 1)` cells per axis.
+pub(crate) struct Levels<N> {
+    pub(crate) layers: Vec<Grid<N>>,
+    pub(crate) root_bounds: Rectangle,
+    pub(crate) geometry: Vec<LayerGeometry>,
+    /// Reciprocal of the node width and height of each level, which `position`
+    /// multiplies by.
+    pub(crate) inverse_node_size: Vec<(f64, f64)>,
+}
+
+/// The levels of a multi-level grid over `world_bounds`, with nodes made by
+/// `node`. Unless `FIT`, the root is a square from the world's minimum corner,
+/// and each level keeps only the rows or columns that cover the world.
+///
+/// Panics if `max_level` is zero or the finest level has more cells than
+/// `usize` counts.
+pub(crate) fn build_levels<N, const FIT: bool>(
+    world_bounds: &Rectangle,
+    max_level: u8,
+    node: impl Fn() -> N,
+) -> Levels<N> {
+    assert!(max_level as usize > 0, "`MAX_LEVEL` cannot be zero.");
+    let n = 1usize
+        .checked_shl((max_level - 1) as u32)
+        .expect("`MAX_LEVEL` is too large and will cause overflow.");
+    assert!(
+        n.checked_mul(n).is_some(),
+        "`MAX_LEVEL` is too large and will cause overflow."
+    );
+
+    let world_width = world_bounds.get_width();
+    let world_height = world_bounds.get_height();
+
+    let mut layers = Vec::with_capacity(max_level as usize + 1);
+    let mut size = 0;
+    for level in 0..=max_level {
+        let (mut rows, mut cols) = (size, size);
+        if !FIT {
+            if world_width > world_height {
+                rows = (size as f64 * world_height / world_width).ceil() as usize;
+            } else if world_height > world_width {
+                cols = (size as f64 / world_height * world_width).ceil() as usize;
+            }
+        }
+        layers.push(Grid::from_vec((0..rows * cols).map(|_| node()).collect(), cols));
+        size = 1 << level;
+    }
+
+    let root_bounds = if !FIT {
+        let len = world_width.max(world_height);
+        let (min_x, min_y) = world_bounds.get_min();
+        Rectangle::center_rect(min_x + len * 0.5, min_y + len * 0.5, len, len)
+    } else {
+        world_bounds.clone()
+    };
+
+    let mut geometry = Vec::with_capacity(layers.len());
+    let mut inverse_node_size = Vec::with_capacity(layers.len());
+    // Level zero is unused, like `layers[0]`.
+    geometry.push(LayerGeometry::default());
+    inverse_node_size.push((0.0, 0.0));
+    for (level, grid) in layers.iter().enumerate().skip(1) {
+        let (node_width, node_height) =
+            LayerGeometry::node_size(&root_bounds, grid.cols(), grid.rows());
+        let inverse = (1.0 / node_width, 1.0 / node_height);
+        geometry.push(LayerGeometry::with_reciprocal(
+            &root_bounds,
+            level,
+            grid.cols(),
+            grid.rows(),
+            inverse.0,
+            inverse.1,
+        ));
+        inverse_node_size.push(inverse);
+    }
+
+    Levels {
+        layers,
+        root_bounds,
+        geometry,
+        inverse_node_size,
     }
 }
 

@@ -434,7 +434,7 @@ impl MaxMultiset {
             assert!(!visited[index]);
             visited[index] = true;
             let branch = &set.branches[index];
-            assert!(branch.shift <= 60 && branch.shift % 6 == 0 && branch.shift < parent_shift);
+            assert!(branch.shift <= 60 && branch.shift.is_multiple_of(6) && branch.shift < parent_shift);
             assert_eq!(branch.children.len(), branch.bitmap.count_ones() as usize);
             assert!((2..=64).contains(&branch.children.len()));
             let mut bitmap = branch.bitmap;

@@ -294,6 +294,133 @@ fn check_updates_and_removals() {
     }
 }
 
+/// Every structure's search with a live ball's own bounds must find that ball.
+/// Balls far from all others are lost without a brute-force search noticing.
+fn assert_balls_find_themselves(trees: &Trees, balls: &[Option<(Ball, Handles)>]) {
+    for (id, (ball, _)) in balls.iter().enumerate().filter_map(|(id, ball)| Some((id, ball.as_ref()?))) {
+        for (name, found) in trees.search(&ball.get_bounds(), usize::MAX) {
+            assert!(found.contains(&id), "{name} lost ball {id}");
+        }
+    }
+}
+
+/// Items centered outside the world must stay findable through inserts, splits,
+/// moves across the world's edge, resizes and removals.
+#[test]
+fn items_centered_outside_the_world_stay_findable() {
+    let mut rng = StdRng::seed_from_u64(11);
+    let world = world();
+    // Three quarters of this area lie outside the world.
+    let around = world.scale(2.0);
+    let mut trees = Trees::new(&world);
+
+    let mut balls: Vec<Option<(Ball, Handles)>> = Vec::new();
+    for _ in 0..BALL_COUNT / 5 {
+        let ball = random_ball(&mut rng, &around);
+        let handles = trees.insert(&ball.get_bounds(), balls.len());
+        balls.push(Some((ball, handles)));
+    }
+    assert_searches_match_brute_force(&trees, &balls);
+    assert_balls_find_themselves(&trees, &balls);
+
+    for step in 0..STEPS {
+        for (ball, handles) in balls.iter_mut().flatten() {
+            // Drift without bouncing, so that balls cross the world's edge,
+            // and now and then jump anywhere.
+            if rng.gen_bool(0.1) {
+                (ball.x, ball.y) = around.get_random_point(&mut rng);
+            } else {
+                ball.x += 40.0 * ball.vx;
+                ball.y += 40.0 * ball.vy;
+            }
+            if rng.gen_bool(0.05) {
+                ball.r = random_radius(&mut rng);
+            }
+            trees.update(&ball.get_bounds(), *handles);
+        }
+        for _ in 0..BALL_COUNT / 100 {
+            let id = rng.gen_range(0..balls.len());
+            if let Some((_, handles)) = balls[id].take() {
+                trees.remove(handles);
+            }
+        }
+        for _ in 0..BALL_COUNT / 200 {
+            let ball = random_ball(&mut rng, &around);
+            let handles = trees.insert(&ball.get_bounds(), balls.len());
+            balls.push(Some((ball, handles)));
+        }
+        if step % 2 == 1 {
+            trees.refresh();
+        }
+        assert_searches_match_brute_force(&trees, &balls);
+        assert_balls_find_themselves(&trees, &balls);
+    }
+}
+
+/// Splitting the root must leave the items centered outside the world in it:
+/// moved into a child, whose loose bounds miss them, searches lost them.
+#[test]
+fn loose_quadtree_split_keeps_items_centered_outside_the_world() {
+    let world = Rectangle::new(0.0, 0.0, 1000.0, 1000.0);
+    let mut tree = LooseQuadTree::<usize, MAX_LEVEL, MAX_ITEMS>::new(world);
+    tree.insert(Rectangle::center_rect(-500.0, 500.0, 10.0, 10.0), 99);
+    for i in 0..MAX_ITEMS {
+        tree.insert(Rectangle::center_rect(100.0 + 80.0 * i as f64, 300.0, 10.0, 10.0), i);
+    }
+    let mut found = Vec::new();
+    tree.search(&Rectangle::center_rect(-500.0, 500.0, 20.0, 20.0), |id| found.push(id));
+    assert_eq!(found, [99]);
+}
+
+/// Every structure holding items that are `Send` and `Sync` is itself `Send`
+/// and `Sync`.
+#[test]
+fn structures_are_send_and_sync() {
+    fn assert_send_sync<S: Send + Sync>() {}
+    assert_send_sync::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>();
+    assert_send_sync::<HierarchicalLooseGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<UniformGrid<usize>>();
+    assert_send_sync::<HierarchicalGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<OverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<SpanGrid<usize>>();
+    assert_send_sync::<HaloGrid<usize>>();
+}
+
+/// A `MAX_LEVEL` of zero, or one whose finest level has more cells than
+/// `usize` counts, is rejected with its own message in every build, instead of
+/// an arithmetic overflow panic in debug builds and a wrapped shift in release.
+macro_rules! rejects_max_level {
+    ($($name:ident: $create:expr, $message:literal;)*) => {
+        $(#[test]
+        #[should_panic(expected = $message)]
+        fn $name() {
+            $create;
+        })*
+    };
+}
+rejects_max_level!(
+    loose_quadtree_rejects_level_zero: LooseQuadTree::<usize, 0, MAX_ITEMS>::new(world()), "cannot be zero";
+    loose_quadtree_rejects_level_65: LooseQuadTree::<usize, 65, MAX_ITEMS>::new(world()), "too large";
+    hierarchical_loose_grid_rejects_level_zero: HierarchicalLooseGrid::<usize, 0>::new(world()), "cannot be zero";
+    hierarchical_loose_grid_rejects_level_65: HierarchicalLooseGrid::<usize, 65>::new(world()), "too large";
+    hierarchical_grid_rejects_level_zero: HierarchicalGrid::<usize, 0>::new(world()), "cannot be zero";
+    hierarchical_grid_rejects_level_65: HierarchicalGrid::<usize, 65>::new(world()), "too large";
+    overflow_bound_grid_rejects_level_zero: OverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    overflow_bound_grid_rejects_level_65: OverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    lazy_grid_rejects_level_zero: LazyOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    lazy_grid_rejects_level_65: LazyOverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    boxed_grid_rejects_level_zero: BoxedOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    boxed_grid_rejects_level_65: BoxedOverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    span_grid_rejects_level_zero: SpanOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    span_grid_rejects_level_65: SpanOverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    halo_grid_rejects_level_zero: HaloOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    halo_grid_rejects_level_65: HaloOverflowBoundGrid::<usize, 65>::new(world()), "too large";
+);
+
 /// Structures whose search narrows the fixed reach of each level to a bound on
 /// how far that level's items extend beyond their cells, or skips cells by the
 /// bounding box of their items.
@@ -307,170 +434,69 @@ trait OverflowBounded {
     fn refresh(&mut self) {}
 }
 
-impl<const L: u8> OverflowBounded for OverflowBoundGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
+/// The methods of `OverflowBounded` that every structure forwards to its own,
+/// and `refresh` for those that tighten their bounds only on request.
+macro_rules! forward_items {
+    ($($refresh:ident)?) => {
+        fn root(&self) -> Rectangle {
+            self.get_bounds().clone()
         }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
+        fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+            self.insert(bounds, id)
+        }
+        fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+            self.update(bounds, handle);
+        }
+        fn remove_item(&mut self, handle: ItemHandle) {
+            self.remove(handle);
+        }
+        fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+            self.search(bounds, callback);
+        }
+        $(fn refresh(&mut self) {
+            self.$refresh();
+        })?
+    };
 }
 
-impl<const L: u8> OverflowBounded for LazyOverflowBoundGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
-        }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
+/// Multi-level structures, whose roots are square or fitted to the world.
+macro_rules! new_or_fit {
+    ($($t:ident $(: $refresh:ident)?),* $(,)?) => {
+        $(impl<const L: u8> OverflowBounded for $t<usize, L> {
+            fn create(world: Rectangle, fit: bool) -> Self {
+                if fit {
+                    Self::new_fit(world)
+                } else {
+                    Self::new(world)
+                }
+            }
+            forward_items!($($refresh)?);
+        })*
+    };
+}
+new_or_fit!(
+    OverflowBoundGrid,
+    LazyOverflowBoundGrid: refresh_bounds,
+    BoxedOverflowBoundGrid: refresh_bounds,
+    SpanOverflowBoundGrid: refresh_bounds,
+    HaloOverflowBoundGrid: refresh_bounds,
+);
+
+/// Cell size of the finest level of the hierarchical structures over `world`,
+/// for the single-level ones. With it `tight_item` puts its finest items in
+/// cells and the larger ones in the overflow node, with many centers on cell
+/// edges.
+fn finest_cell_size(world: &Rectangle) -> f64 {
+    let side = world.get_width().max(world.get_height());
+    side / (1u32 << (MAX_LEVEL - 1)) as f64
 }
 
-impl<const L: u8> OverflowBounded for BoxedOverflowBoundGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
-        }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
-}
-
-
-impl<const L: u8> OverflowBounded for SpanOverflowBoundGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
-        }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
-}
-
-impl<const L: u8> OverflowBounded for HaloOverflowBoundGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
-        }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
-}
-
-/// Cells of the finest level of the hierarchical structures, so that
-/// `tight_item` puts its finest items in cells and the larger ones in the
-/// overflow node, with many centers on cell edges.
 impl OverflowBounded for HaloGrid<usize> {
     fn create(world: Rectangle, _fit: bool) -> Self {
-        let side = world.get_width().max(world.get_height());
-        Self::new(world, side / (1u32 << (MAX_LEVEL - 1)) as f64)
+        let cell_size = finest_cell_size(&world);
+        Self::new(world, cell_size)
     }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
+    forward_items!(refresh_bounds);
 }
 
 /// Worlds with square and non-square roots, and with an offset origin.
@@ -1016,96 +1042,28 @@ fn check_sparse_levels_with_few_levels() {
 /// hierarchical structures where they need a cell size.
 impl OverflowBounded for UniformGrid<usize> {
     fn create(world: Rectangle, _fit: bool) -> Self {
-        let side = world.get_width().max(world.get_height());
-        Self::new(world, side / (1u32 << (MAX_LEVEL - 1)) as f64)
+        let cell_size = finest_cell_size(&world);
+        Self::new(world, cell_size)
     }
-    fn root(&self) -> Rectangle {
-        self.get_bounds()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
+    forward_items!();
 }
 
 impl OverflowBounded for SpanGrid<usize> {
     fn create(world: Rectangle, _fit: bool) -> Self {
-        let side = world.get_width().max(world.get_height());
-        Self::new(world, side / (1u32 << (MAX_LEVEL - 1)) as f64)
+        let cell_size = finest_cell_size(&world);
+        Self::new(world, cell_size)
     }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-    fn refresh(&mut self) {
-        self.refresh_bounds();
-    }
+    forward_items!(refresh_bounds);
 }
 
 impl<const L: u8> OverflowBounded for HierarchicalGrid<usize, L> {
     fn create(world: Rectangle, _fit: bool) -> Self {
         Self::new(world)
     }
-    fn root(&self) -> Rectangle {
-        self.get_bounds()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
+    forward_items!();
 }
 
-impl<const L: u8> OverflowBounded for HierarchicalLooseGrid<usize, L> {
-    fn create(world: Rectangle, fit: bool) -> Self {
-        if fit {
-            Self::new_fit(world)
-        } else {
-            Self::new(world)
-        }
-    }
-    fn root(&self) -> Rectangle {
-        self.get_bounds().clone()
-    }
-    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
-        self.insert(bounds, id)
-    }
-    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
-        self.update(bounds, handle);
-    }
-    fn remove_item(&mut self, handle: ItemHandle) {
-        self.remove(handle);
-    }
-    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
-        self.search(bounds, callback);
-    }
-}
+new_or_fit!(HierarchicalLooseGrid);
 
 /// Structures that search with the bounds of every stored item in one pass.
 trait SelfQuery {

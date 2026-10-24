@@ -53,7 +53,9 @@ pub struct HierarchicalGrid<T: Copy, const MAX_LEVEL: u8> {
 impl<T: Copy, const MAX_LEVEL: u8> HierarchicalGrid<T, MAX_LEVEL> {
     pub fn new(world_bounds: Rectangle) -> Self {
         assert!(MAX_LEVEL > 0, "`MAX_LEVEL` cannot be zero.");
-        let finest = 1usize << (MAX_LEVEL - 1);
+        let finest = 1usize
+            .checked_shl((MAX_LEVEL - 1) as u32)
+            .expect("`MAX_LEVEL` is too large and will cause overflow.");
         assert!(
             finest.checked_mul(finest).is_some(),
             "`MAX_LEVEL` is too large and will cause overflow."

@@ -49,7 +49,10 @@ pub(crate) fn cell_overflow(
 /// `min` also handles a NaN `low`, with six more instructions around its
 /// `minsd` on x86-64. The column-and-row and neighbor grids grow a box and
 /// two spans with every store; using these there instead of `min` and `max`
-/// cut their update times by 3-13%.
+/// cut their update times by 3-13%. In the boxed, lazy and single-level grids,
+/// which grow boxes, spans or refreshed level bounds the same way, they cut the
+/// update benchmarks by 5-15% on one machine and by up to 5% on another
+/// (`bench-results/lower-higher-port-2026-10-24.md`).
 #[inline(always)]
 pub(crate) fn lower(low: f64, value: f64) -> f64 {
     if value < low { value } else { low }

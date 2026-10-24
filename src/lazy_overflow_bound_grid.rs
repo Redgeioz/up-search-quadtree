@@ -4,7 +4,7 @@ use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
 };
 use crate::overflow_bound_grid::DirectionalOverflow;
-use crate::overflow_bound::{LevelReach, cell_overflow, rounding_slack};
+use crate::overflow_bound::{LevelReach, cell_overflow, higher, rounding_slack};
 use crate::rect::Rectangle;
 use grid::*;
 
@@ -148,7 +148,7 @@ impl<T: Copy, const MAX_LEVEL: u8> LazyOverflowBoundGrid<T, MAX_LEVEL> {
                         for entry in &grid[y][x].items {
                             let overflow = cell_overflow(&entry.bounds, origin, node_size, (x, y));
                             for (largest, overflow) in largest.iter_mut().zip(overflow) {
-                                *largest = largest.max(overflow);
+                                *largest = higher(*largest, overflow);
                             }
                         }
                     }

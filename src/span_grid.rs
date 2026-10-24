@@ -22,6 +22,7 @@
 use crate::cell_order::for_each_cell_in_morton_order;
 use crate::handle::{Entry, GridLocation, ItemHandle, Slots};
 use crate::layer_geometry::{LayerGeometry, first_reaching_node, last_reaching_node};
+use crate::overflow_bound::{higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
 use grid::*;
 
@@ -460,15 +461,15 @@ impl LineSpan {
     fn widen(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
         self.widen_column(x, bounds);
         let row = &mut self.rows[y];
-        row[0] = row[0].min(bounds.min_y);
-        row[1] = row[1].max(bounds.max_y);
+        row[0] = lower(row[0], bounds.min_y);
+        row[1] = higher(row[1], bounds.max_y);
     }
 
     #[inline]
     fn widen_column(&mut self, x: usize, bounds: &Rectangle) {
         let column = &mut self.columns[x];
-        column[0] = column[0].min(bounds.min_x);
-        column[1] = column[1].max(bounds.max_x);
+        column[0] = lower(column[0], bounds.min_x);
+        column[1] = higher(column[1], bounds.max_x);
     }
 }
 
@@ -488,10 +489,10 @@ impl<T: Copy> Node<T> {
 
     #[inline]
     fn grow(&mut self, bounds: &Rectangle) {
-        self.bounds.min_x = self.bounds.min_x.min(bounds.min_x);
-        self.bounds.min_y = self.bounds.min_y.min(bounds.min_y);
-        self.bounds.max_x = self.bounds.max_x.max(bounds.max_x);
-        self.bounds.max_y = self.bounds.max_y.max(bounds.max_y);
+        self.bounds.min_x = lower(self.bounds.min_x, bounds.min_x);
+        self.bounds.min_y = lower(self.bounds.min_y, bounds.min_y);
+        self.bounds.max_x = higher(self.bounds.max_x, bounds.max_x);
+        self.bounds.max_y = higher(self.bounds.max_y, bounds.max_y);
     }
 
     fn refresh(&mut self) {

@@ -4,7 +4,7 @@ use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
 };
 use crate::overflow_bound_grid::DirectionalOverflow;
-use crate::overflow_bound::{LevelReach, cell_overflow, rounding_slack};
+use crate::overflow_bound::{LevelReach, cell_overflow, higher, lower, rounding_slack};
 use crate::rect::{EMPTY, Rectangle};
 use grid::*;
 
@@ -166,7 +166,7 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                     if !node.items.is_empty() {
                         let overflow = cell_overflow(&node.bounds, origin, node_size, (x, y));
                         for (largest, overflow) in largest.iter_mut().zip(overflow) {
-                            *largest = largest.max(overflow);
+                            *largest = higher(*largest, overflow);
                         }
                     }
                     x += 1;
@@ -642,10 +642,10 @@ impl<T: Copy> BoxedOverflowBoundGridNode<T> {
 /// query.
 #[inline]
 fn cover(target: &mut Rectangle, bounds: &Rectangle) {
-    target.min_x = target.min_x.min(bounds.min_x);
-    target.min_y = target.min_y.min(bounds.min_y);
-    target.max_x = target.max_x.max(bounds.max_x);
-    target.max_y = target.max_y.max(bounds.max_y);
+    target.min_x = lower(target.min_x, bounds.min_x);
+    target.min_y = lower(target.min_y, bounds.min_y);
+    target.max_x = higher(target.max_x, bounds.max_x);
+    target.max_y = higher(target.max_y, bounds.max_y);
 }
 
 #[cfg(test)]

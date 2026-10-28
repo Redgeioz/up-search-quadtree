@@ -3,7 +3,7 @@ use crate::cell_order::for_each_cell_hierarchically;
 use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, half_node_corners, scan_range, size_level,
 };
-use crate::overflow_bound_grid::DirectionalOverflow;
+use crate::exact_overflow_bound_grid::DirectionalOverflow;
 use crate::overflow_bound::{cell_overflow, higher, lower};
 use crate::rect::{EMPTY, NOWHERE, Rectangle};
 use grid::*;
@@ -25,8 +25,9 @@ type Layers<T> = Vec<Grid<HaloOverflowBoundGridNode<T>>>;
 /// nearly always meets the query. A neighbor that is read is still skipped
 /// when its box misses the query.
 ///
-/// The column and row spans of [`SpanOverflowBoundGrid`] remain, but only
-/// trim the edges of the scan over finer levels.
+/// The column and row spans of [`SpanOverflowBoundGrid`] remain: they trim
+/// the edges of the scan over finer levels, and stand in for the copies near
+/// touched rows of a stale level, as described below.
 ///
 /// Insertion and update only widen the box of the target node and the spans
 /// of its column and row, and mark the level stale and the row touched; the
@@ -228,7 +229,7 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
                 } else {
                     for (x, node) in grid[y].iter().enumerate() {
                         if !node.items.is_empty() {
-                            lines.grow_column(x, &node.bounds);
+                            lines.widen_column(x, &node.bounds);
                         }
                     }
                 }
@@ -434,8 +435,8 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
     /// Check cheaply whether `position` would still return `coord` for
     /// `bounds`.
     ///
-    /// See [`HierarchicalLooseGrid`](crate::HierarchicalLooseGrid) for why the
-    /// cached limits agree with `position` exactly.
+    /// [`LayerGeometry::matches_layer`] and [`LayerGeometry::matches_cell`]
+    /// explain why the cached limits agree with `position` exactly.
     fn stays_in_node(&self, bounds: &Rectangle, coord: Coord) -> bool {
         let (level, x, y) = coord;
         let geometry = &self.geometry[level];
@@ -478,6 +479,48 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             |level, x, y| {
                 for entry in &layers[level][y][x].items {
                     self.search(&entry.bounds, |found| callback(entry.item, found));
+                }
+            },
+        );
+    }
+
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. On its own level
+    /// an item reads only the items after it in its own node and the nodes
+    /// after its own in row-major order, that is the neighbor to the right
+    /// and those in the row below, where a search with its bounds would read
+    /// them; items in the root pair up with the root items after them. Below
+    /// its level an item scans the finer levels as a search does, so a pair
+    /// across levels is found once, by the item on the coarser level, and no
+    /// item looks above its own level. The nodes are visited as in
+    /// [`for_each_self_query`](Self::for_each_self_query).
+    ///
+    /// Leaving each cross-level pair to its finer item instead, which walked
+    /// the ancestor path as a search does, took 0.56 ms against 0.28 ms on the
+    /// mixed distribution: nearly all items lie on the finest level, and each
+    /// of them paid for a walk over the occupied levels above it.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for (index, entry) in layers[level][y][x].items.iter().enumerate() {
+                    let mut report = |found| callback(entry.item, found);
+                    if level == 1 {
+                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                    } else {
+                        self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
+                    }
+                    if level < finest {
+                        self.pair_scan_down(level, &entry.bounds, &mut report);
+                    }
                 }
             },
         );
@@ -593,6 +636,123 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
         self.search_up_3x3(level, bounds, &mut callback);
     }
 
+    /// Search the half stencil of [`for_each_pair`] on level `level`: node
+    /// `(x, y)` after its item `start`, and of the neighbors after it in
+    /// row-major order those that the ancestor walk of a search with
+    /// `bounds` would read, by the same tests.
+    ///
+    /// [`for_each_pair`]: Self::for_each_pair
+    fn pair_half_stencil(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        start: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        let grid = &self.layers[level];
+        let lines = &self.lines[level];
+        // As in `search_up_3x3`: copies can be stale only on a stale level.
+        if self.marks[level].stale && lines.near_touched(y) {
+            pair_half_3x3_by_spans(grid, lines, (x, y), start, bounds, callback);
+        } else {
+            pair_half_3x3_by_copies(grid, &self.halo[level], (x, y), start, bounds, callback);
+        }
+    }
+
+    /// Scan the levels finer than `level` over `bounds` for
+    /// [`for_each_pair`](Self::for_each_pair) as [`search`](Self::search)
+    /// scans the levels finer than a query's, a copy so that pair queries and
+    /// searches share no code.
+    fn pair_scan_down(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        // As in `search`: a NaN corner meets nothing, while for a NaN minimum
+        // the scan would report the items of the nodes it takes as inside
+        // `bounds` untested.
+        if bounds.has_nan() {
+            return;
+        }
+        let max_level = MAX_LEVEL as usize;
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let layers = &self.layers;
+        // The corners of `bounds` relative to the root origin, in half nodes
+        // of the finest level; every level's scan range follows by shifts.
+        let half = half_node_corners(
+            [
+                bounds.min_x - offset_x,
+                bounds.min_y - offset_y,
+                bounds.max_x - offset_x,
+                bounds.max_y - offset_y,
+            ],
+            self.inverse_node_size[max_level],
+        );
+
+        layers[level + 1..=max_level]
+            .iter()
+            .zip(&self.geometry[level + 1..=max_level])
+            .zip(&self.lines[level + 1..=max_level])
+            .rev()
+            .enumerate()
+            .for_each(|(shift, ((grid, geometry), lines))| {
+                if geometry.is_empty() {
+                    return;
+                }
+                let grid_width = grid.cols();
+                let grid_height = grid.rows();
+
+                let [min_coord_x, min_coord_y, max_coord_x, max_coord_y] =
+                    scan_range(half, shift as u32, (grid_width - 1, grid_height - 1));
+
+                // The fixed reach overshoots by about one column and row
+                // per side; drop an edge column or row whose span misses
+                // the query. Loops dropping more measured slower on large
+                // queries.
+                let column_reaches = |x: usize| {
+                    let [low, high] = unsafe { *lines.columns.get_unchecked(x) };
+                    high > bounds.min_x && low < bounds.max_x
+                };
+                let row_reaches = |y: usize| {
+                    let [low, high] = unsafe { *lines.rows.get_unchecked(y) };
+                    high > bounds.min_y && low < bounds.max_y
+                };
+                let (mut first_x, mut end_x) = (min_coord_x, max_coord_x + 1);
+                if first_x < end_x && !column_reaches(first_x) {
+                    first_x += 1;
+                }
+                if end_x > first_x && !column_reaches(end_x - 1) {
+                    end_x -= 1;
+                }
+                let (mut first_y, mut end_y) = (min_coord_y, max_coord_y + 1);
+                if first_y < end_y && !row_reaches(first_y) {
+                    first_y += 1;
+                }
+                if end_y > first_y && !row_reaches(end_y - 1) {
+                    end_y -= 1;
+                }
+
+                // Scan the remaining range.
+                for y in first_y..end_y {
+                    for x in first_x..end_x {
+                        let node = unsafe { grid.get_unchecked(y, x) };
+                        if node.items.is_empty() {
+                            continue;
+                        }
+
+                        if y > min_coord_y + 1
+                            && y < max_coord_y - 1
+                            && x > min_coord_x + 1
+                            && x < max_coord_x - 1
+                        {
+                            // The node lies within `bounds`, loose bounds
+                            // included, so its items need no intersection test.
+                            node.pair_all(callback);
+                        } else {
+                            node.pair_with(bounds, callback);
+                        }
+                    }
+                }
+            });
+    }
+
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         let (mut x, mut y) = self.cell_containing(level, bounds.get_center());
 
@@ -629,6 +789,83 @@ impl<T: Copy, const MAX_LEVEL: u8> HaloOverflowBoundGrid<T, MAX_LEVEL> {
             });
 
         self.get_root().search_items(bounds, callback);
+    }
+}
+
+/// The half stencil of [`search_3x3_by_copies`] for the pair queries: node
+/// `(x, y)` after its item `start`, and its neighbors to the right and in
+/// the row below.
+#[inline]
+fn pair_half_3x3_by_copies<T: Copy>(
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
+    halo: &[Halo],
+    (x, y): (usize, usize),
+    start: usize,
+    bounds: &Rectangle,
+    callback: &mut impl FnMut(T),
+) {
+    // SAFETY: as in `search_3x3_by_copies`.
+    unsafe {
+        let halo = halo.get_unchecked(y * grid.cols() + x);
+        let after = bounds.max_x > halo.right;
+        let down = bounds.max_y > halo.bottom;
+        let down_before =
+            (bounds.min_x < halo.bottom_left[0]) & (bounds.max_y > halo.bottom_left[1]);
+        let down_after =
+            (bounds.max_x > halo.bottom_right[0]) & (bounds.max_y > halo.bottom_right[1]);
+        grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+        if after {
+            grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+        }
+        if down_before {
+            grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+        }
+        if down {
+            grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+        }
+        if down_after {
+            grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+        }
+    }
+}
+
+/// The half stencil of [`search_3x3_by_spans`] for the pair queries: node
+/// `(x, y)` after its item `start`, and its neighbors to the right and in
+/// the row below.
+#[inline]
+fn pair_half_3x3_by_spans<T: Copy>(
+    grid: &Grid<HaloOverflowBoundGridNode<T>>,
+    lines: &LineSpan,
+    (x, y): (usize, usize),
+    start: usize,
+    bounds: &Rectangle,
+    callback: &mut impl FnMut(T),
+) {
+    let grid_width = grid.cols();
+    let grid_height = grid.rows();
+    // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
+    // after testing that it exists; clamped indices read an in-bounds line
+    // whose result the edge tests discard.
+    unsafe {
+        let below = lines.rows.get_unchecked((y + 1).min(grid_height - 1))[0];
+        let left_of = lines.columns.get_unchecked(x.saturating_sub(1))[1];
+        let right_of = lines.columns.get_unchecked((x + 1).min(grid_width - 1))[0];
+        let down = (y + 1 != grid_height) & (bounds.max_y > below);
+        let before = (x != 0) & (bounds.min_x < left_of);
+        let after = (x + 1 != grid_width) & (bounds.max_x > right_of);
+        grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+        if after {
+            grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+        }
+        if down {
+            if before {
+                grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+            }
+            grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+            if after {
+                grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+            }
+        }
     }
 }
 
@@ -856,7 +1093,7 @@ impl LineSpan {
     /// row; the refresh does this for every box of a touched row.
     #[inline]
     fn widen(&mut self, (x, y): (usize, usize), bounds: &Rectangle) {
-        self.grow_column(x, bounds);
+        self.widen_column(x, bounds);
         let row = &mut self.rows[y];
         row[0] = lower(row[0], bounds.min_y);
         row[1] = higher(row[1], bounds.max_y);
@@ -864,7 +1101,7 @@ impl LineSpan {
 
     /// Widen column `x` alone to cover `bounds`.
     #[inline]
-    fn grow_column(&mut self, x: usize, bounds: &Rectangle) {
+    fn widen_column(&mut self, x: usize, bounds: &Rectangle) {
         let column = &mut self.columns[x];
         column[0] = lower(column[0], bounds.min_x);
         column[1] = higher(column[1], bounds.max_x);
@@ -1035,7 +1272,7 @@ impl<T: Copy> HaloOverflowBoundGridNode<T> {
 
     /// Shrink the box to the bounds of the items stored now.
     fn refresh(&mut self) {
-        let Self { bounds, items, .. } = self;
+        let Self { bounds, items } = self;
         *bounds = EMPTY;
         for entry in items.iter() {
             cover(bounds, &entry.bounds);
@@ -1050,6 +1287,33 @@ impl<T: Copy> HaloOverflowBoundGridNode<T> {
             .iter()
             .filter(|entry| entry.bounds.intersects(bounds))
             .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        if !self.bounds.intersects(bounds) {
+            return;
+        }
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// Test the items after `index` against `bounds`, without the box, which
+    /// covers the item at `index` and thus meets any query it makes.
+    fn pair_with_after(&self, index: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items[index + 1..]
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`iter_items`](Self::iter_items) for the pair queries, a copy so that
+    /// they share no code with the searches.
+    fn pair_all(&self, callback: &mut impl FnMut(T)) {
+        self.items.iter().for_each(|entry| callback(entry.item));
     }
 
     fn iter_items(&self, callback: &mut impl FnMut(T)) {
@@ -1169,26 +1433,18 @@ mod tests {
                     } else if !lines.near_touched(y) {
                         assert!(covers(copies, exact), "{context}");
                     }
-                    let initial = &NO_HALO;
-                    if x == 0 {
-                        assert_eq!(copies.left, initial.left, "{context}");
-                        assert_eq!(copies.top_left, initial.top_left, "{context}");
-                        assert_eq!(copies.bottom_left, initial.bottom_left, "{context}");
-                    }
-                    if x + 1 == cols {
-                        assert_eq!(copies.right, initial.right, "{context}");
-                        assert_eq!(copies.top_right, initial.top_right, "{context}");
-                        assert_eq!(copies.bottom_right, initial.bottom_right, "{context}");
-                    }
-                    if y == 0 {
-                        assert_eq!(copies.top, initial.top, "{context}");
-                        assert_eq!(copies.top_left, initial.top_left, "{context}");
-                        assert_eq!(copies.top_right, initial.top_right, "{context}");
-                    }
-                    if y + 1 == rows {
-                        assert_eq!(copies.bottom, initial.bottom, "{context}");
-                        assert_eq!(copies.bottom_left, initial.bottom_left, "{context}");
-                        assert_eq!(copies.bottom_right, initial.bottom_right, "{context}");
+                    // An edge node keeps the initial copies of the neighbors it lacks.
+                    type Side = fn(&Halo) -> (f64, [f64; 2], [f64; 2]);
+                    let edges: [(bool, Side); 4] = [
+                        (x == 0, |h| (h.left, h.top_left, h.bottom_left)),
+                        (x + 1 == cols, |h| (h.right, h.top_right, h.bottom_right)),
+                        (y == 0, |h| (h.top, h.top_left, h.top_right)),
+                        (y + 1 == rows, |h| (h.bottom, h.bottom_left, h.bottom_right)),
+                    ];
+                    for (at_edge, side) in edges {
+                        if at_edge {
+                            assert_eq!(side(copies), side(&NO_HALO), "{context}");
+                        }
                     }
                 }
             }
@@ -1200,6 +1456,10 @@ mod tests {
     /// The spans and copies of a clear level are exact.
     #[test]
     fn marks_follow_stores_and_takes() {
+        const TAKEN: Marks = Marks {
+            touched: true,
+            stale: false,
+        };
         let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
         let finest = MAX_LEVEL as usize;
         let small = Rectangle::center_rect(100.0, 100.0, 4.0, 4.0);
@@ -1223,24 +1483,12 @@ mod tests {
         // Moved to another level: stored there, taken here.
         tree.update(big.clone(), handle);
         assert_eq!(tree.marks[coarser], Marks::STORED);
-        assert_eq!(
-            tree.marks[finest],
-            Marks {
-                touched: true,
-                stale: false
-            }
-        );
+        assert_eq!(tree.marks[finest], TAKEN);
         tree.refresh_bounds();
         assert!(clear(&tree));
 
         tree.remove(handle);
-        assert_eq!(
-            tree.marks[coarser],
-            Marks {
-                touched: true,
-                stale: false
-            }
-        );
+        assert_eq!(tree.marks[coarser], TAKEN);
         assert_eq!(tree.marks[finest], Marks::default());
         tree.refresh_bounds();
         assert!(clear(&tree));

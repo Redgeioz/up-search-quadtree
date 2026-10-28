@@ -17,7 +17,7 @@ macro_rules! coarsest_occupied {
 pub(crate) use coarsest_occupied;
 
 /// Tests of the grids that keep no bounds to refresh, `HierarchicalLooseGrid`
-/// and `OverflowBoundGrid`.
+/// and `ExactOverflowBoundGrid`.
 macro_rules! exact_reach_tests {
     () => {
         $crate::grid_tests::coarsest_occupied!();
@@ -192,8 +192,8 @@ macro_rules! exact_reach_tests {
 }
 pub(crate) use exact_reach_tests;
 
-/// Tests of the grids whose per-level bounds only shrink on refresh.
-macro_rules! lazy_bound_tests {
+/// Tests of the grids whose bounds or boxes only shrink on refresh.
+macro_rules! refreshed_tests {
     () => {
         $crate::grid_tests::coarsest_occupied!();
 
@@ -254,10 +254,6 @@ macro_rules! lazy_bound_tests {
             let height = root.get_height() * scale * rng.gen_range(0.5..1.0);
             let (x, y) = root.get_random_point(rng);
             Rectangle::center_rect(x, y, width, height)
-        }
-
-        fn directions(bound: DirectionalOverflow) -> [f64; 4] {
-            [bound.left, bound.right, bound.top, bound.bottom]
         }
 
         /// `coarsest_level()` must be the coarsest level below the root that holds
@@ -323,6 +319,19 @@ macro_rules! lazy_bound_tests {
             let mut found = Vec::new();
             tree.search(&query, |id| found.push(id));
             assert_eq!(found, vec![0]);
+        }
+    };
+}
+pub(crate) use refreshed_tests;
+
+/// The tests of `refreshed_tests`, and those of the grids whose per-level
+/// bounds only shrink on refresh.
+macro_rules! lazy_bound_tests {
+    () => {
+        $crate::grid_tests::refreshed_tests!();
+
+        fn directions(bound: DirectionalOverflow) -> [f64; 4] {
+            [bound.left, bound.right, bound.top, bound.bottom]
         }
 
         /// Items that keep off their cell edges give negative bounds, before and
@@ -391,12 +400,9 @@ macro_rules! lazy_bound_tests {
 }
 pub(crate) use lazy_bound_tests;
 
-/// The tests of `lazy_bound_tests`, and those of the grids that also keep a
-/// box per node, whose node type is `$node`.
-macro_rules! boxed_tests {
+/// Helpers for the grids that keep a box per node, whose node type is `$node`.
+macro_rules! box_helpers {
     ($node:ident) => {
-        $crate::grid_tests::lazy_bound_tests!();
-
         /// A small move or resize that usually keeps the item in its node.
         fn nudge(rng: &mut StdRng, bounds: &Rectangle) -> Rectangle {
             let (x, y) = bounds.get_center();
@@ -436,17 +442,20 @@ macro_rules! boxed_tests {
                         assert_eq!(node.bounds, union, "{context}");
                     } else {
                         let b = &node.bounds;
-                        assert!(
-                            b.min_x <= union.min_x
-                                && b.min_y <= union.min_y
-                                && b.max_x >= union.max_x
-                                && b.max_y >= union.max_y,
-                            "{context}: box {b:?} misses {union:?}"
-                        );
+                        assert!(b.contains(&union), "{context}: box {b:?} misses {union:?}");
                     }
                 }
             }
         }
+    };
+}
+pub(crate) use box_helpers;
+
+/// Tests of the grids whose boxes, of node type `$node`, only shrink on
+/// refresh. Uses `random_bounds` of `refreshed_tests`.
+macro_rules! lazy_box_tests {
+    ($node:ident) => {
+        $crate::grid_tests::box_helpers!($node);
 
         /// Run random insertions, small and large updates and removals in every
         /// world, square and fitted. Every 500 steps, refresh and call `check`
@@ -498,6 +507,40 @@ macro_rules! boxed_tests {
             exercise(0, |tree, _, refreshed| assert_boxes(tree, refreshed));
         }
 
+        /// Boxes tighten only in `refresh_bounds`, except that a node left
+        /// without items resets its box immediately.
+        #[test]
+        fn refresh_shrinks_boxes_and_emptied_nodes_reset_them() {
+            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
+            let wide = Rectangle::center_rect(100.0, 100.0, 10.0, 10.0);
+            let narrow = Rectangle::center_rect(100.0, 100.0, 8.0, 8.0);
+            let handle = tree.insert(wide.clone(), 0);
+            let coord @ (level, x, y) = tree.position(&wide);
+            assert_eq!(
+                tree.position(&narrow),
+                coord,
+                "both bounds belong to one node"
+            );
+
+            tree.update(narrow.clone(), handle);
+            assert_eq!(tree.layers[level][y][x].bounds, wide);
+            tree.refresh_bounds();
+            assert_eq!(tree.layers[level][y][x].bounds, narrow);
+
+            tree.remove(handle);
+            assert_eq!(tree.layers[level][y][x].bounds, EMPTY);
+        }
+    };
+}
+pub(crate) use lazy_box_tests;
+
+/// The tests of `lazy_bound_tests` and `lazy_box_tests`, for the grids that
+/// keep a box per node, whose node type is `$node`, besides per-level bounds.
+macro_rules! boxed_tests {
+    ($node:ident) => {
+        $crate::grid_tests::lazy_bound_tests!();
+        $crate::grid_tests::lazy_box_tests!($node);
+
         /// Largest overflow of the items of `level` beyond their cells, computed
         /// item by item: negative when all keep off that edge, -infinity without
         /// items.
@@ -541,30 +584,6 @@ macro_rules! boxed_tests {
                     }
                 }
             });
-        }
-
-        /// Boxes tighten only in `refresh_bounds`, except that a node left
-        /// without items resets its box immediately.
-        #[test]
-        fn refresh_shrinks_boxes_and_emptied_nodes_reset_them() {
-            let mut tree = Tree::new(Rectangle::new(0.0, 0.0, 1024.0, 1024.0));
-            let wide = Rectangle::center_rect(100.0, 100.0, 10.0, 10.0);
-            let narrow = Rectangle::center_rect(100.0, 100.0, 8.0, 8.0);
-            let handle = tree.insert(wide.clone(), 0);
-            let coord @ (level, x, y) = tree.position(&wide);
-            assert_eq!(
-                tree.position(&narrow),
-                coord,
-                "both bounds belong to one node"
-            );
-
-            tree.update(narrow.clone(), handle);
-            assert_eq!(tree.layers[level][y][x].bounds, wide);
-            tree.refresh_bounds();
-            assert_eq!(tree.layers[level][y][x].bounds, narrow);
-
-            tree.remove(handle);
-            assert_eq!(tree.layers[level][y][x].bounds, EMPTY);
         }
     };
 }
@@ -666,13 +685,7 @@ macro_rules! span_tests {
                     if refreshed {
                         assert_eq!(*root, exact, "{context}");
                     } else {
-                        assert!(
-                            root.min_x <= exact.min_x
-                                && root.min_y <= exact.min_y
-                                && root.max_x >= exact.max_x
-                                && root.max_y >= exact.max_y,
-                            "{context}: {root:?} misses {exact:?}"
-                        );
+                        assert!(root.contains(&exact), "{context}: {root:?} misses {exact:?}");
                     }
                     let mut found = Vec::new();
                     tree.search(&query, |id| found.push(id));

@@ -260,6 +260,111 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalGrid<T, MAX_LEVEL> {
         );
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. Each item scans
+    /// only its own level and the coarser ones, as a search with its bounds
+    /// would, so a pair across levels is found once, by the item on the finer
+    /// level. On its own level an item reads only the items after it in its
+    /// own cell and the cells after its own in row-major order. Items of
+    /// level 1 pair up with the level-1 items after them. The cells are
+    /// visited as in [`for_each_self_query`](Self::for_each_self_query).
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cells_per_axis, layers[level].cells_per_axis),
+            |level, x, y| {
+                let layer = &layers[level];
+                let cell = &layer.cells[y * layer.cells_per_axis + x];
+                for (index, entry) in cell.iter().enumerate() {
+                    let bounds = &entry.bounds;
+                    let mut report = |found| callback(entry.item, found);
+                    cell[index + 1..]
+                        .iter()
+                        .filter(|other| other.bounds.intersects(bounds))
+                        .for_each(|other| report(other.item));
+                    if level != 1 {
+                        self.pair_coarser(level, (x, y), bounds, &mut report);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Scan level `level` from the cell after `(x, y)` in row-major order,
+    /// the coarser levels and level 1 as [`search`](Self::search) scans them,
+    /// for [`for_each_pair`](Self::for_each_pair).
+    fn pair_coarser(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        // As in `search`: a NaN corner would scan cells taken as inside it.
+        if bounds.has_nan() {
+            return;
+        }
+        let inverse_half_cell = self.layers[MAX_LEVEL as usize].inverse_cell_size * 2.0;
+        let half = [
+            ((bounds.min_x - self.origin_x) * inverse_half_cell) as i64,
+            ((bounds.min_y - self.origin_y) * inverse_half_cell) as i64,
+            ((bounds.max_x - self.origin_x) * inverse_half_cell) as i64,
+            ((bounds.max_y - self.origin_y) * inverse_half_cell) as i64,
+        ];
+        for scanned in (2..=level).rev() {
+            if self.geometry[scanned].is_empty() {
+                continue;
+            }
+            let layer = &self.layers[scanned];
+            let shift = MAX_LEVEL as usize - scanned;
+            let [min_x, min_y, max_x, max_y] = half.map(|coordinate| coordinate >> shift);
+            let last = layer.cells_per_axis as i64 - 1;
+            let first_cx = (min_x.saturating_sub(1) >> 1).clamp(0, last) as usize;
+            let first_cy = (min_y.saturating_sub(1) >> 1).clamp(0, last) as usize;
+            let last_cx = (max_x.saturating_add(1) >> 1).clamp(0, last) as usize;
+            let last_cy = (max_y.saturating_add(1) >> 1).clamp(0, last) as usize;
+            let inner_min_x = min_x.saturating_add(1) >> 1;
+            let inner_min_y = min_y.saturating_add(1) >> 1;
+            let inner_max_x = max_x.saturating_sub(3) >> 1;
+            let inner_max_y = max_y.saturating_sub(3) >> 1;
+            // On the item's own level, only the cells after its own.
+            let own = scanned == level;
+            let start_cy = if own { first_cy.max(y) } else { first_cy };
+            for cy in start_cy..=last_cy {
+                let start_cx = if own && cy == y { first_cx.max(x + 1) } else { first_cx };
+                let inner_row = (cy as i64) > inner_min_y && (cy as i64) < inner_max_y;
+                for cx in start_cx..=last_cx {
+                    let cell = &layer.cells[cy * layer.cells_per_axis + cx];
+                    if inner_row && (cx as i64) > inner_min_x && (cx as i64) < inner_max_x {
+                        for entry in cell {
+                            callback(entry.item);
+                        }
+                    } else {
+                        for entry in cell {
+                            if entry.bounds.intersects(bounds) {
+                                callback(entry.item);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !self.geometry[1].is_empty() {
+            for entry in &self.layers[1].cells[0] {
+                if entry.bounds.intersects(bounds) {
+                    callback(entry.item);
+                }
+            }
+        }
+    }
+
     /// Call `callback` for every item whose bounds intersect `bounds`,
     /// finest level first.
     ///

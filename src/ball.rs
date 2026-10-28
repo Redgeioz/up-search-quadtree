@@ -89,15 +89,16 @@ impl Ball {
                 (1.0, 0.0)
             };
 
+            let total_mass = self.mass + other.mass;
             let p = 2.0 * (self.vx * cos + self.vy * sin - other.vx * cos - other.vy * sin)
-                / (self.mass + other.mass);
+                / total_mass;
             self.vx -= p * other.mass * cos;
             self.vy -= p * other.mass * sin;
             other.vx += p * self.mass * cos;
             other.vy += p * self.mass * sin;
 
-            let w1 = self.mass / (self.mass + other.mass);
-            let w2 = other.mass / (self.mass + other.mass);
+            let w1 = self.mass / total_mass;
+            let w2 = other.mass / total_mass;
 
             self.x += w2 * cos * diff;
             self.y += w2 * sin * diff;

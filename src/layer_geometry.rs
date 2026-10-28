@@ -18,7 +18,8 @@ use grid::Grid;
 pub(crate) struct LayerGeometry {
     // `search` reads only the first three fields of each level it visits.
     pub(crate) object_count: usize,
-    /// Size of a cell: the root size divided by `2^(level - 1)`.
+    /// Size of a cell: the root size divided by the larger of the grid's
+    /// column and row counts, `2^(level - 1)` on the levels of a hierarchy.
     ///
     /// Also the largest object size (inclusive) that `position` assigns to
     /// this level; `matches_layer` explains why the comparison is exact.
@@ -56,37 +57,6 @@ impl LayerGeometry {
         inverse_node_width: f64,
         inverse_node_height: f64,
     ) -> Self {
-        Self::build(
-            root_bounds,
-            level,
-            cols,
-            rows,
-            |x| (x * inverse_node_width) as usize,
-            |y| (y * inverse_node_height) as usize,
-        )
-    }
-
-    /// Node size of a level whose grid has `cols` by `rows` cells: the root
-    /// size divided by the larger count, as a grid trimmed to a non-square
-    /// world keeps the cell size of the full square grid.
-    pub(crate) fn node_size(root_bounds: &Rectangle, cols: usize, rows: usize) -> (f64, f64) {
-        let cells_per_axis = cols.max(rows) as f64;
-        (
-            root_bounds.get_width() / cells_per_axis,
-            root_bounds.get_height() / cells_per_axis,
-        )
-    }
-
-    /// `cell_of_x` and `cell_of_y` map a coordinate relative to the root
-    /// origin to its cell exactly as the structure's `position` does.
-    fn build(
-        root_bounds: &Rectangle,
-        level: usize,
-        cols: usize,
-        rows: usize,
-        cell_of_x: impl Fn(f64) -> usize,
-        cell_of_y: impl Fn(f64) -> usize,
-    ) -> Self {
         let root_width = root_bounds.get_width();
         let root_height = root_bounds.get_height();
         let (node_width, node_height) = Self::node_size(root_bounds, cols, rows);
@@ -106,6 +76,10 @@ impl LayerGeometry {
             };
         }
 
+        // A coordinate relative to the root origin maps to its cell exactly
+        // as in the structure's `position`.
+        let cell_of_x = |x: f64| (x * inverse_node_width) as usize;
+        let cell_of_y = |y: f64| (y * inverse_node_height) as usize;
         Self {
             object_count: 0,
             node_width,
@@ -115,6 +89,17 @@ impl LayerGeometry {
             cell_x_edges: Self::cell_edges(node_width, cols, cell_of_x),
             cell_y_edges: Self::cell_edges(node_height, rows, cell_of_y),
         }
+    }
+
+    /// Node size of a level whose grid has `cols` by `rows` cells: the root
+    /// size divided by the larger count, as a grid trimmed to a non-square
+    /// world keeps the cell size of the full square grid.
+    pub(crate) fn node_size(root_bounds: &Rectangle, cols: usize, rows: usize) -> (f64, f64) {
+        let cells_per_axis = cols.max(rows) as f64;
+        (
+            root_bounds.get_width() / cells_per_axis,
+            root_bounds.get_height() / cells_per_axis,
+        )
     }
 
     // The predicates below are not generic but run inside generic tree
@@ -539,28 +524,7 @@ mod tests {
         let first = |n: f64| reaching_by_rounding(n).0;
         let last = |n: f64| reaching_by_rounding(n).1;
         let cap = 1usize << 61;
-        let mut values = vec![
-            0.0,
-            f64::MIN_POSITIVE,
-            5e-324,
-            f64::MAX,
-            f64::INFINITY,
-            f64::NAN,
-        ];
-        for whole in -10..=10 {
-            values.extend([whole as f64, whole as f64 + 0.5]);
-        }
-        for power in 0..70 {
-            let value = 2f64.powi(power);
-            values.extend([value, value + 0.5, value - 0.5, value * 1.5]);
-        }
-        let mut rng = StdRng::seed_from_u64(31);
-        for _ in 0..20000 {
-            values.push(rng.gen_range(-3.0..300.0));
-            values.push(rng.gen_range(-3i32..300) as f64 * 0.5);
-            values.push(2f64.powf(rng.gen_range(-1074.0..1023.0)) * rng.gen_range(1.0..2.0));
-        }
-        for value in values {
+        for value in special_values(31) {
             for n in around(value, 3).into_iter().flat_map(|n| [n, -n]) {
                 assert_eq!(
                     first_reaching_node(n).min(cap),
@@ -576,13 +540,10 @@ mod tests {
         }
     }
 
-    /// `ceil_from_truncation` must give what `ceil` and the saturating cast
-    /// give: for values on, next to and halfway between whole numbers, on both
-    /// sides of zero, near the powers of two where floats stop holding
-    /// fractions and where the cast saturates, random over the whole range of
-    /// floats, and the special values.
-    #[test]
-    fn ceil_from_truncation_agrees_with_ceil() {
+    /// The special values, whole and half numbers around zero, the powers of
+    /// two up to where the saturating cast stops and their neighbors, and
+    /// random values of every magnitude drawn with `seed`.
+    fn special_values(seed: u64) -> Vec<f64> {
         let mut values = vec![
             0.0,
             f64::MIN_POSITIVE,
@@ -598,13 +559,23 @@ mod tests {
             let value = 2f64.powi(power);
             values.extend([value, value + 0.5, value - 0.5, value * 1.5]);
         }
-        let mut rng = StdRng::seed_from_u64(29);
+        let mut rng = StdRng::seed_from_u64(seed);
         for _ in 0..20000 {
             values.push(rng.gen_range(-3.0..300.0));
             values.push(rng.gen_range(-3i32..300) as f64 * 0.5);
             values.push(2f64.powf(rng.gen_range(-1074.0..1023.0)) * rng.gen_range(1.0..2.0));
         }
-        for value in values {
+        values
+    }
+
+    /// `ceil_from_truncation` must give what `ceil` and the saturating cast
+    /// give: for values on, next to and halfway between whole numbers, on both
+    /// sides of zero, near the powers of two where floats stop holding
+    /// fractions and where the cast saturates, random over the whole range of
+    /// floats, and the special values.
+    #[test]
+    fn ceil_from_truncation_agrees_with_ceil() {
+        for value in special_values(29) {
             for v in around(value, 3).into_iter().flat_map(|v| [v, -v]) {
                 assert_eq!(
                     ceil_from_truncation(v, v as i64),

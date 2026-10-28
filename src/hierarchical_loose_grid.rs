@@ -270,6 +270,48 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         );
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. On its own level
+    /// an item reads only the items after it in its own node and the nodes
+    /// after its own in row-major order, that is the neighbor to the right
+    /// and those in the row below, where a search with its bounds would read
+    /// them; items in the root pair up with the root items after them. Below
+    /// its level an item scans the finer levels as a search does, so a pair
+    /// across levels is found once, by the item on the coarser level, and no
+    /// item looks above its own level. The nodes are visited as in
+    /// [`for_each_self_query`](Self::for_each_self_query).
+    ///
+    /// Leaving each cross-level pair to its finer item instead, which walked
+    /// the ancestor path as a search does, took 1.18 ms against 0.55 ms on the
+    /// mixed distribution: nearly all items lie on the finest level, and each
+    /// of them paid for a walk over the occupied levels above it.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for (index, entry) in layers[level][y][x].items.iter().enumerate() {
+                    let mut report = |found| callback(entry.item, found);
+                    if level == 1 {
+                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                    } else {
+                        self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
+                    }
+                    if level < finest {
+                        self.pair_scan_down(level, &entry.bounds, &mut report);
+                    }
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up, calling `callback` for each item found.
     ///
     /// The query's level follows from its size, as for an item. On each finer
@@ -354,6 +396,111 @@ impl<T: Copy, const MAX_LEVEL: u8> HierarchicalLooseGrid<T, MAX_LEVEL> {
         }
 
         self.search_up_3x3(level, bounds, &mut callback);
+    }
+
+    /// Search the half stencil of [`for_each_pair`] on level `level`: node
+    /// `(x, y)` after its item `start`, and of the neighbors after it in
+    /// row-major order those that the ancestor walk of a search with
+    /// `bounds` would read, by the same center-line tests.
+    ///
+    /// [`for_each_pair`]: Self::for_each_pair
+    fn pair_half_stencil(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        start: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        let grid = &self.layers[level];
+        let geometry = &self.geometry[level];
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let center_x = offset_x + geometry.node_width * (x as f64 + 0.5);
+        let center_y = offset_y + geometry.node_height * (y as f64 + 0.5);
+        let to_right = bounds.max_x >= center_x && x + 1 != grid.cols();
+        let to_left = bounds.min_x <= center_x && x != 0;
+        // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
+        // after testing that it exists.
+        unsafe {
+            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            if to_right {
+                grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+            }
+            if bounds.max_y >= center_y && y + 1 != grid.rows() {
+                if to_left {
+                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+                }
+                grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+                if to_right {
+                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+                }
+            }
+        }
+    }
+
+    /// Scan the levels finer than `level` over `bounds` for
+    /// [`for_each_pair`](Self::for_each_pair) as [`search`](Self::search)
+    /// scans the levels finer than a query's, a copy so that pair queries and
+    /// searches share no code.
+    fn pair_scan_down(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        // As in `search`: a NaN corner meets nothing, while for a NaN minimum
+        // the scan would report the items of the nodes it takes as inside
+        // `bounds` untested.
+        if bounds.has_nan() {
+            return;
+        }
+        let max_level = MAX_LEVEL as usize;
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let layers = &self.layers;
+        // The corners of `bounds` relative to the root origin, in half nodes
+        // of the finest level; every level's scan range follows by shifts.
+        let half = half_node_corners(
+            [
+                bounds.min_x - offset_x,
+                bounds.min_y - offset_y,
+                bounds.max_x - offset_x,
+                bounds.max_y - offset_y,
+            ],
+            self.inverse_node_size[max_level],
+        );
+
+        layers[level + 1..=max_level]
+            .iter()
+            .zip(&self.geometry[level + 1..=max_level])
+            .rev()
+            .enumerate()
+            .for_each(|(shift, (grid, geometry))| {
+                if geometry.is_empty() {
+                    return;
+                }
+                let grid_width = grid.cols();
+                let grid_height = grid.rows();
+
+                let [min_coord_x, min_coord_y, max_coord_x, max_coord_y] =
+                    scan_range(half, shift as u32, (grid_width - 1, grid_height - 1));
+
+                // Scan the resulting range.
+                for y in min_coord_y..=max_coord_y {
+                    for x in min_coord_x..=max_coord_x {
+                        let node = unsafe { grid.get_unchecked(y, x) };
+                        if node.items.is_empty() {
+                            continue;
+                        }
+
+                        if y > min_coord_y + 1
+                            && y < max_coord_y - 1
+                            && x > min_coord_x + 1
+                            && x < max_coord_x - 1
+                        {
+                            // The node lies within `bounds`, loose bounds
+                            // included, so its items need no intersection test.
+                            node.pair_all(callback);
+                        } else {
+                            node.pair_with(bounds, callback);
+                        }
+                    }
+                }
+            });
     }
 
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
@@ -483,6 +630,29 @@ impl<T: Copy> HierarchicalLooseGridNode<T> {
             .iter()
             .filter(|entry| entry.bounds.intersects(bounds))
             .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// Test the items after `index` against `bounds`.
+    fn pair_with_after(&self, index: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items[index + 1..]
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`iter_items`](Self::iter_items) for the pair queries, a copy so that
+    /// they share no code with the searches.
+    fn pair_all(&self, callback: &mut impl FnMut(T)) {
+        self.items.iter().for_each(|entry| callback(entry.item));
     }
 
     fn iter_items(&self, callback: &mut impl FnMut(T)) {

@@ -17,10 +17,15 @@ const HALF_CELL_SIZE: f64 = GRID_CELL_SIZE / 2.0;
 /// `MIN_RADIUS..MAX_RADIUS` that double at most `doublings` times, each time
 /// with a chance of a quarter.
 fn ball_bounds(doublings: usize) -> Vec<Rectangle> {
+    ball_bounds_in(&BOUNDS, AMOUNT, doublings)
+}
+
+/// [`ball_bounds`] for `count` balls in `world`.
+fn ball_bounds_in(world: &Rectangle, count: usize, doublings: usize) -> Vec<Rectangle> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
-    (0..AMOUNT)
+    (0..count)
         .map(|_| {
-            let (x, y) = BOUNDS.get_random_point(&mut rng);
+            let (x, y) = world.get_random_point(&mut rng);
             let mut r = rng.gen_range(MIN_RADIUS..MAX_RADIUS);
             for _ in 0..doublings {
                 if rng.gen_bool(0.25) {
@@ -74,10 +79,13 @@ fn search(c: &mut Criterion) {
     arm!(LooseQuadTree);
     arm!(HierarchicalLooseGrid);
     arm!(UniformGrid, GRID_CELL_SIZE);
+    arm!(TwoLayerGrid, GRID_CELL_SIZE);
+    arm!(MultiGrid, &MULTI_CELL_SIZES);
+    bench_search(c, "MultiGrid/2", tree!(MultiGrid, &MULTI_CELL_SIZES_2));
     arm!(HierarchicalGrid);
-    arm!(OverflowBoundGrid);
+    arm!(ExactOverflowBoundGrid);
+    arm!(BoxedLooseGrid);
     arm!(LazyOverflowBoundGrid);
-    arm!(BoxedOverflowBoundGrid);
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     arm!(SpanGrid, GRID_CELL_SIZE);
@@ -120,13 +128,15 @@ fn small_balls(c: &mut Criterion) {
         };
     }
     arm!(HierarchicalLooseGrid);
-    arm!(OverflowBoundGrid);
+    arm!(ExactOverflowBoundGrid);
+    arm!(BoxedLooseGrid);
     arm!(LazyOverflowBoundGrid);
-    arm!(BoxedOverflowBoundGrid);
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     for (name, cell) in [("312", GRID_CELL_SIZE), ("156", HALF_CELL_SIZE)] {
+        bench_small_balls(&mut group, &format!("MultiGrid/{name}"), tree!(MultiGrid, &[cell]));
         arm!(UniformGrid / name, cell);
+        arm!(TwoLayerGrid / name, cell);
         arm!(SpanGrid / name, cell);
         arm!(HaloGrid / name, cell);
     }
@@ -204,12 +214,13 @@ fn aligned(c: &mut Criterion) {
         };
     }
     arm!(HierarchicalLooseGrid);
-    arm!(OverflowBoundGrid);
+    arm!(ExactOverflowBoundGrid);
+    arm!(BoxedLooseGrid);
     arm!(LazyOverflowBoundGrid);
-    arm!(BoxedOverflowBoundGrid);
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     arm!(UniformGrid / "312", GRID_CELL_SIZE);
+    arm!(TwoLayerGrid / "312", GRID_CELL_SIZE);
     arm!(SpanGrid / "312", GRID_CELL_SIZE);
     arm!(HaloGrid / "312", GRID_CELL_SIZE);
     group.finish();
@@ -274,13 +285,14 @@ fn two_tier(c: &mut Criterion, name: &str, scene: (Vec<Rectangle>, Vec<Rectangle
         };
     }
     arm!(bench_two_tier, HierarchicalLooseGrid);
-    arm!(bench_two_tier, OverflowBoundGrid);
+    arm!(bench_two_tier, ExactOverflowBoundGrid);
+    arm!(bench_two_tier, BoxedLooseGrid);
     arm!(bench_two_tier, LazyOverflowBoundGrid);
-    arm!(bench_two_tier, BoxedOverflowBoundGrid);
     arm!(bench_two_tier, SpanOverflowBoundGrid);
     arm!(bench_two_tier, HaloOverflowBoundGrid);
 
-    arm!(bench_stale, BoxedOverflowBoundGrid);
+    arm!(bench_stale, BoxedLooseGrid);
+    arm!(bench_stale, LazyOverflowBoundGrid);
     arm!(bench_stale, SpanOverflowBoundGrid);
     arm!(bench_stale, HaloOverflowBoundGrid);
     group.finish();
@@ -367,7 +379,8 @@ fn moving(c: &mut Criterion) {
                 bench_moving(&mut group, stringify!($t), tree!($t), scene)
             };
         }
-        arm!(BoxedOverflowBoundGrid);
+        arm!(BoxedLooseGrid);
+        arm!(LazyOverflowBoundGrid);
         arm!(SpanOverflowBoundGrid);
         arm!(HaloOverflowBoundGrid);
     }
@@ -422,16 +435,131 @@ fn self_query(c: &mut Criterion) {
             })
         };
     }
-    arm!(OverflowBoundGrid);
+    arm!(ExactOverflowBoundGrid);
+    arm!(BoxedLooseGrid);
     arm!(LazyOverflowBoundGrid);
-    arm!(BoxedOverflowBoundGrid);
     arm!(SpanOverflowBoundGrid);
     arm!(HaloOverflowBoundGrid);
     arm!(HierarchicalLooseGrid);
     arm!(HierarchicalGrid);
     arm!(UniformGrid, GRID_CELL_SIZE);
+    arm!(TwoLayerGrid, GRID_CELL_SIZE);
     arm!(SpanGrid, GRID_CELL_SIZE);
     arm!(HaloGrid, GRID_CELL_SIZE);
+    group.finish();
+}
+
+/// Report every intersecting pair of the balls of [`ball_bounds`], doubled up
+/// to `doublings` times, once, with each structure's pair rules; the pair
+/// count, printed once, must agree.
+fn bench_pairs<Tree: QTree<usize>>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    tree: Tree,
+    doublings: usize,
+    pairs: impl Fn(&Tree, &mut dyn FnMut(usize, usize)),
+) {
+    bench_pairs_on(group, name, tree, &ball_bounds(doublings), pairs);
+}
+
+/// [`bench_pairs`] for the items `bounds`, numbered in order.
+fn bench_pairs_on<Tree: QTree<usize>>(
+    group: &mut BenchmarkGroup<WallTime>,
+    name: &str,
+    mut tree: Tree,
+    bounds: &[Rectangle],
+    pairs: impl Fn(&Tree, &mut dyn FnMut(usize, usize)),
+) {
+    for (id, bounds) in bounds.iter().enumerate() {
+        tree.insert_item(bounds.clone(), id);
+    }
+    tree.end_frame();
+    let mut count = 0usize;
+    pairs(&tree, &mut |_, _| count += 1);
+    eprintln!("{name}: {count} pairs");
+    group.bench_function(name, |b| {
+        b.iter(|| {
+            pairs(&tree, &mut |a, b| {
+                black_box((a, b));
+            })
+        })
+    });
+}
+
+fn pairs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pairs");
+    macro_rules! arm {
+        ($name:expr, $tree:expr) => {
+            bench_pairs(&mut group, $name, $tree, 5, |tree, callback| {
+                tree.for_each_pair(|a, b| callback(a, b))
+            })
+        };
+    }
+    arm!("ExactOverflowBoundGrid", tree!(ExactOverflowBoundGrid));
+    arm!("LazyOverflowBoundGrid", tree!(LazyOverflowBoundGrid));
+    arm!("SpanOverflowBoundGrid", tree!(SpanOverflowBoundGrid));
+    arm!("HaloOverflowBoundGrid", tree!(HaloOverflowBoundGrid));
+    arm!("MultiGrid", tree!(MultiGrid, &MULTI_CELL_SIZES));
+    arm!("MultiGrid/2", tree!(MultiGrid, &MULTI_CELL_SIZES_2));
+    arm!("HierarchicalLooseGrid", tree!(HierarchicalLooseGrid));
+    arm!("BoxedLooseGrid", tree!(BoxedLooseGrid));
+    arm!("HierarchicalGrid", tree!(HierarchicalGrid));
+    arm!("UniformGrid", tree!(UniformGrid, GRID_CELL_SIZE));
+    arm!("TwoLayerGrid", tree!(TwoLayerGrid, GRID_CELL_SIZE));
+    arm!("SpanGrid", tree!(SpanGrid, GRID_CELL_SIZE));
+    arm!("HaloGrid", tree!(HaloGrid, GRID_CELL_SIZE));
+    arm!("LooseQuadTree", tree!(LooseQuadTree));
+    arm!("SortAndSweep", SortAndSweep::new());
+    bench_pairs(&mut group, "SortAndSweep/scalar", SortAndSweep::new(), 5, |tree, callback| {
+        tree.for_each_pair_scalar(|a, b| callback(a, b))
+    });
+    arm!("SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
+    group.finish();
+}
+
+/// [`pairs`] in a scene sixteen times as large at the same density, for the
+/// grids compared with the sweep, whose candidates on x grow with the number
+/// of items per column of the world.
+fn pairs_160k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pairs_160k");
+    group.sample_size(10);
+    let bounds = ball_bounds_in(&LARGE_BOUNDS, LARGE_AMOUNT, 5);
+    macro_rules! arm {
+        ($name:expr, $tree:expr) => {
+            bench_pairs_on(&mut group, $name, $tree, &bounds, |tree, callback| {
+                tree.for_each_pair(|a, b| callback(a, b))
+            })
+        };
+    }
+    arm!("HierarchicalLooseGrid", HierarchicalLooseGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
+    arm!("HaloOverflowBoundGrid", HaloOverflowBoundGrid::<usize, LARGE_MAX_LEVEL>::new(LARGE_BOUNDS.clone()));
+    arm!("UniformGrid", UniformGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!("TwoLayerGrid", TwoLayerGrid::<usize>::new(LARGE_BOUNDS.clone(), GRID_CELL_SIZE));
+    arm!("SortAndSweep", SortAndSweep::new());
+    bench_pairs_on(&mut group, "SortAndSweep/scalar", SortAndSweep::new(), &bounds, |tree, callback| {
+        tree.for_each_pair_scalar(|a, b| callback(a, b))
+    });
+    arm!("SortAndSweep/unsorted", UnsortedSweep(SortAndSweep::new()));
+    group.finish();
+}
+
+/// The pairs of the small balls, which all fit a cell, in the single-level
+/// grids with cells of 156.25 units; `MultiGrid` with one collection is a
+/// single-level loose grid without bounds.
+fn small_pairs(c: &mut Criterion) {
+    let mut group = c.benchmark_group("small_pairs");
+    macro_rules! arm {
+        ($name:expr, $tree:expr) => {
+            bench_pairs(&mut group, $name, $tree, 0, |tree, callback| {
+                tree.for_each_pair(|a, b| callback(a, b))
+            })
+        };
+    }
+    arm!("MultiGrid/156", tree!(MultiGrid, &[HALF_CELL_SIZE]));
+    arm!("UniformGrid/156", tree!(UniformGrid, HALF_CELL_SIZE));
+    arm!("TwoLayerGrid/156", tree!(TwoLayerGrid, HALF_CELL_SIZE));
+    arm!("SpanGrid/156", tree!(SpanGrid, HALF_CELL_SIZE));
+    arm!("HaloGrid/156", tree!(HaloGrid, HALF_CELL_SIZE));
     group.finish();
 }
 
@@ -444,5 +572,8 @@ criterion_group!(
     adjacent,
     moving,
     self_query,
+    pairs,
+    small_pairs,
+    pairs_160k,
 );
 criterion_main!(bench);

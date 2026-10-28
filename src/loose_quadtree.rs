@@ -35,18 +35,10 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
             "`MAX_LEVEL` is too large and will cause overflow."
         );
 
-        let mut root_width = world_bounds.get_width();
-        let mut root_height = world_bounds.get_height();
-
         let root_bounds = if !FIT {
-            let len = root_width.max(root_height);
-            root_width = len;
-            root_height = len;
-
+            let len = world_bounds.get_width().max(world_bounds.get_height());
             let (min_x, min_y) = world_bounds.get_min();
-            let center_x = min_x + len * 0.5;
-            let center_y = min_y + len * 0.5;
-            Rectangle::center_rect(center_x, center_y, root_width, root_height)
+            Rectangle::center_rect(min_x + len * 0.5, min_y + len * 0.5, len, len)
         } else {
             world_bounds.clone()
         };
@@ -199,6 +191,19 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize> LooseQuadTree<T, MAX_
     /// for each.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
         self.root.search(bounds, &mut callback);
+    }
+
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. The nodes are
+    /// numbered in depth-first preorder; each item reads the items after it
+    /// in its own node and searches, as [`search`](Self::search) does, only
+    /// the nodes numbered after its own, skipping every subtree that lies
+    /// wholly before.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let mut sizes = Vec::new();
+        self.root.pair_subtree_sizes(&mut sizes);
+        let mut next = 0;
+        self.root.pair_items(&self.root, &sizes, &mut next, &mut callback);
     }
 }
 
@@ -356,7 +361,108 @@ impl<T: Copy, const MAX_LEVEL: u8, const MAX_ITEMS: usize>
         self.search_items(bounds, callback);
     }
 
+    /// Push the size of every subtree of this node, in preorder, and return
+    /// that of its own.
+    fn pair_subtree_sizes(&self, sizes: &mut Vec<u32>) -> u32 {
+        let at = sizes.len();
+        sizes.push(0);
+        let mut size = 1;
+        if let Some(children) = &self.children {
+            for child in children.iter() {
+                size += child.pair_subtree_sizes(sizes);
+            }
+        }
+        sizes[at] = size;
+        size
+    }
+
+    /// Visit the nodes of this subtree in preorder, numbering them from
+    /// `next`, and pair each item with the items after it in its node and
+    /// with those of the nodes numbered after its own in the tree of `root`.
+    fn pair_items(
+        &self,
+        root: &Self,
+        sizes: &[u32],
+        next: &mut usize,
+        callback: &mut impl FnMut(T, T),
+    ) {
+        let number = *next;
+        *next += 1;
+        for (index, entry) in self.items.iter().enumerate() {
+            let mut report = |found| callback(entry.item, found);
+            self.items[index + 1..]
+                .iter()
+                .filter(|other| other.bounds.intersects(&entry.bounds))
+                .for_each(|other| report(other.item));
+            root.pair_after(0, sizes, number + 1, &entry.bounds, &mut report);
+        }
+        if let Some(children) = &self.children {
+            for child in children.iter() {
+                child.pair_items(root, sizes, next, callback);
+            }
+        }
+    }
+
+    /// As `search`, for this node numbered `number` in
+    /// preorder, but reading the items of the nodes numbered `first` or
+    /// later only.
+    fn pair_after(
+        &self,
+        number: usize,
+        sizes: &[u32],
+        first: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        if number + sizes[number] as usize <= first {
+            return;
+        }
+        if let Some(children) = &self.children {
+            let [tl, tr, bl, br] = children.as_ref();
+            let (min_x, min_y) = tl.loose_bounds.get_min();
+            let (x_left, y_top) = br.loose_bounds.get_min();
+            let (max_x, max_y) = br.loose_bounds.get_max();
+            let (x_right, y_bottom) = tl.loose_bounds.get_max();
+
+            let children_bounds = Rectangle::new(min_x, min_y, max_x, max_y);
+            if children_bounds.intersects(bounds) {
+                let tl_number = number + 1;
+                let tr_number = tl_number + sizes[tl_number] as usize;
+                let bl_number = tr_number + sizes[tr_number] as usize;
+                let br_number = bl_number + sizes[bl_number] as usize;
+                if bounds.min_y < y_bottom {
+                    if bounds.min_x < x_right {
+                        tl.pair_after(tl_number, sizes, first, bounds, callback);
+                    }
+                    if bounds.max_x > x_left {
+                        tr.pair_after(tr_number, sizes, first, bounds, callback);
+                    }
+                }
+                if bounds.max_y > y_top {
+                    if bounds.min_x < x_right {
+                        bl.pair_after(bl_number, sizes, first, bounds, callback);
+                    }
+                    if bounds.max_x > x_left {
+                        br.pair_after(br_number, sizes, first, bounds, callback);
+                    }
+                }
+            }
+        }
+        if number >= first {
+            self.pair_with(bounds, callback);
+        }
+    }
+
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         self.items
             .iter()
             .filter(|entry| entry.bounds.intersects(bounds))

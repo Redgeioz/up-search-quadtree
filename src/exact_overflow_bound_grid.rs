@@ -4,8 +4,8 @@ use crate::cell_order::for_each_cell_hierarchically;
 use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
 };
-use crate::overflow_bound::rounding_slack;
-use crate::rect::Rectangle;
+use crate::overflow_bound::{higher, lower, rounding_slack};
+use crate::rect::{EMPTY, Rectangle};
 use grid::*;
 
 /// (level, x, y)
@@ -14,7 +14,8 @@ type Layers<T> = Vec<Grid<OverflowBoundGridNode<T>>>;
 
 /// Signed distances beyond the original cell edges, in world units: negative
 /// where the bounds stay inside an edge. As level maxima, -infinity in every
-/// direction on a level without items. Top is -y, bottom +y.
+/// direction on a level without items. Top is -y, bottom +y. The lazy grids
+/// return bounds on these maxima that hold since their last refresh.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DirectionalOverflow {
     pub left: f64,
@@ -31,15 +32,15 @@ impl DirectionalOverflow {
 
 struct LevelOverflow {
     directions: [MaxMultiset; 4],
-    /// Fraction of half a node by which search shrinks the fixed reach in each
-    /// direction, kept in step with the maxima. It is exactly zero once a
-    /// maximum plus the slack covers half a node; search then matches the
-    /// hierarchical loose grid.
+    /// Multiple of half a node by which search shrinks the fixed reach in each
+    /// direction, kept in step with the maxima. It exceeds one once a maximum
+    /// plus the slack is negative, is infinite on a level without items, and
+    /// is exactly zero once that sum covers half a node; search then matches
+    /// the hierarchical loose grid.
     ///
     /// Computing it in search places a chain of dependent float operations
     /// before the neighbor checks, which measured the search of
-    /// [`LazyOverflowBoundGrid`](crate::LazyOverflowBoundGrid) about 40%
-    /// slower.
+    /// `LazyOverflowBoundGrid`, then without cell boxes, about 40% slower.
     shrink: [f64; 4],
     /// Reciprocal of half the node width and height.
     inverse_half_node: (f64, f64),
@@ -118,7 +119,15 @@ impl LevelOverflow {
 /// the magnitude of that maximum, less the margin. Square cells (`new`) and
 /// fitted cells (`new_fit`) follow the positioning of the hierarchical loose
 /// grid.
-pub struct OverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
+///
+/// Every node also keeps a box equal to the union of the bounds of its items,
+/// and search skips a node whose box misses the query without reading its
+/// items. Insertion and moving in grow the box. Removal, moving out and an
+/// update within the node recompute it from the remaining items when the old
+/// bounds touched one of its sides, and otherwise only grow it, so the box
+/// stays exact at all times without a refresh. Boxes consist of item
+/// coordinates, so their tests need no rounding margin.
+pub struct ExactOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
@@ -142,11 +151,11 @@ pub struct OverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> ExactOverflowBoundGrid<T, MAX_LEVEL> {
     /// Create a new overflow-bound grid with the given bounds.
     ///
     /// Every node is square, which usually makes searches more efficient.
-    pub fn new(world_bounds: Rectangle) -> OverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new(world_bounds: Rectangle) -> ExactOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
@@ -154,11 +163,11 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
     ///
     /// Nodes divide the given bounds evenly along each axis instead of being
     /// square.
-    pub fn new_fit(world_bounds: Rectangle) -> OverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new_fit(world_bounds: Rectangle) -> ExactOverflowBoundGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(world_bounds: Rectangle) -> OverflowBoundGrid<T, MAX_LEVEL> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> ExactOverflowBoundGrid<T, MAX_LEVEL> {
         let Levels {
             layers,
             root_bounds,
@@ -168,7 +177,7 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
 
         let slack = rounding_slack(&root_bounds);
 
-        OverflowBoundGrid {
+        ExactOverflowBoundGrid {
             overflow: geometry
                 .iter()
                 .map(|geometry| {
@@ -264,11 +273,13 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
     /// width; growth of the node and slot vectors is amortized O(1).
     ///
     /// Panics if a coordinate of `bounds` is NaN, which the overflow
-    /// multisets cannot order.
+    /// multisets cannot order. The panic comes after the entry is stored, so
+    /// a grid whose panic is caught is left inconsistent.
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         let coord @ (level, x, y) = self.position(&bounds);
         let overflow = self.item_overflow(&bounds, coord);
         let node = &mut self.layers[level][y][x];
+        node.grow(&bounds);
         let handle = self
             .slots
             .allocate(GridLocation::new(coord, node.items.len()));
@@ -300,7 +311,8 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
     /// overflow maxima.
     ///
     /// Panics if the handle has already been removed, or if a coordinate of
-    /// `bounds` is NaN.
+    /// `bounds` is NaN; as in [`insert`](Self::insert), the NaN panic leaves
+    /// the grid inconsistent if it is caught.
     pub fn update(&mut self, bounds: Rectangle, handle: ItemHandle) {
         let location = self.slots.get(handle);
         let prev_coord @ (level, x, y) = location.coord();
@@ -311,7 +323,7 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         if self.stays_in_node(&bounds, prev_coord) {
             let new_overflow = self.item_overflow(&bounds, prev_coord);
             self.overflow[level].replace(old_overflow, new_overflow, self.slack);
-            self.layers[level][y][x].items[i].bounds = bounds;
+            self.layers[level][y][x].replace_bounds(i, bounds);
             return;
         }
 
@@ -319,7 +331,7 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         if curt_coord == prev_coord {
             let new_overflow = self.item_overflow(&bounds, prev_coord);
             self.overflow[level].replace(old_overflow, new_overflow, self.slack);
-            self.layers[level][y][x].items[i].bounds = bounds;
+            self.layers[level][y][x].replace_bounds(i, bounds);
             return;
         }
 
@@ -333,6 +345,7 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         }
         let entry = self.take_entry(level, x, y, i);
         let new_node = &mut self.layers[nl][ny][nx];
+        new_node.grow(&bounds);
         *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
         new_node.items.push(Entry { bounds, ..entry });
         self.occupy(nl);
@@ -360,9 +373,9 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         ((self.occupied_levels & !0b11).trailing_zeros() as usize).min(MAX_LEVEL as usize + 1)
     }
 
-    /// Take the entry at `index` out of a node by swap removal. The entry that
-    /// fills the gap has its slot updated, so handles stay valid without a
-    /// lookup.
+    /// Take the entry at `index` out of a node by swap removal, and shrink the
+    /// box of the node if the entry touched it. The entry that fills the gap
+    /// has its slot updated, so handles stay valid without a lookup.
     ///
     /// Takes plain coordinates rather than a `GridLocation`; keeping the whole
     /// location alive across `update` measured several percent slower.
@@ -371,6 +384,9 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         let entry = node.items.swap_remove(index);
         if let Some(moved) = node.items.get(index) {
             self.slots.get_mut(moved.handle).index = index as u32;
+        }
+        if node.touches(&entry.bounds) {
+            node.refresh();
         }
         entry
     }
@@ -430,11 +446,54 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         );
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. On its own level
+    /// an item reads only the items after it in its own node and the nodes
+    /// after its own in row-major order, that is the neighbor to the right
+    /// and those in the row below, where a search with its bounds would read
+    /// them; items in the root pair up with the root items after them. Below
+    /// its level an item scans the finer levels as a search does, so a pair
+    /// across levels is found once, by the item on the coarser level, and no
+    /// item looks above its own level. The nodes are visited as in
+    /// [`for_each_self_query`](Self::for_each_self_query).
+    ///
+    /// Leaving each cross-level pair to its finer item instead, which walked
+    /// the ancestor path as a search does, took 1.07 ms against 0.38 ms on the
+    /// mixed distribution: nearly all items lie on the finest level, and each
+    /// of them paid for a walk over the occupied levels above it.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for (index, entry) in layers[level][y][x].items.iter().enumerate() {
+                    let mut report = |found| callback(entry.item, found);
+                    if level == 1 {
+                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                    } else {
+                        self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
+                    }
+                    if level < finest {
+                        self.pair_scan_down(level, &entry.bounds, &mut report);
+                    }
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up, calling `callback` for each item found.
     ///
     /// Follows [`HierarchicalLooseGrid::search`], except that each level
     /// reaches beyond its cells only as far as its overflow maxima, plus the
-    /// rounding margin, require.
+    /// rounding margin, require, and that a node whose box misses the query is
+    /// skipped without reading its items.
     ///
     /// [`HierarchicalLooseGrid::search`]: crate::HierarchicalLooseGrid::search
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
@@ -519,6 +578,128 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
         }
 
         self.search_up_3x3(level, bounds, &mut callback);
+    }
+
+    /// Search the half stencil of [`for_each_pair`] on level `level`: node
+    /// `(x, y)` after its item `start`, and of the neighbors after it in
+    /// row-major order those that the ancestor walk of a search with
+    /// `bounds` would read, by the same tests.
+    ///
+    /// [`for_each_pair`]: Self::for_each_pair
+    fn pair_half_stencil(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        start: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        let grid = &self.layers[level];
+        let geometry = &self.geometry[level];
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let half_width = geometry.node_width * 0.5;
+        let half_height = geometry.node_height * 0.5;
+        let center_x = offset_x + geometry.node_width * (x as f64 + 0.5);
+        let center_y = offset_y + geometry.node_height * (y as f64 + 0.5);
+        let [left, right, top, _] = self.overflow[level].shrink;
+        let left_column_reach = center_x - right * half_width;
+        let right_column_reach = center_x + left * half_width;
+        let bottom_row_reach = center_y + top * half_height;
+        let to_right = bounds.max_x >= right_column_reach && x + 1 != grid.cols();
+        let to_left = bounds.min_x <= left_column_reach && x != 0;
+        // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
+        // after testing that it exists.
+        unsafe {
+            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            if to_right {
+                grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+            }
+            if bounds.max_y >= bottom_row_reach && y + 1 != grid.rows() {
+                if to_left {
+                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+                }
+                grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+                if to_right {
+                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+                }
+            }
+        }
+    }
+
+    /// Scan the levels finer than `level` over `bounds` for
+    /// [`for_each_pair`](Self::for_each_pair) as [`search`](Self::search)
+    /// scans the levels finer than a query's, a copy so that pair queries and
+    /// searches share no code.
+    fn pair_scan_down(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        // As in `search`: a NaN corner meets nothing, while for a NaN minimum
+        // the scan would report the items of the nodes it takes as inside
+        // `bounds` untested.
+        if bounds.has_nan() {
+            return;
+        }
+        let max_level = MAX_LEVEL as usize;
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let layers = &self.layers;
+        // Top-left corner relative to the root origin.
+        let min_x = bounds.min_x - offset_x;
+        let min_y = bounds.min_y - offset_y;
+
+        // Bottom-right corner relative to the root origin.
+        let max_x = bounds.max_x - offset_x;
+        let max_y = bounds.max_y - offset_y;
+
+        layers[level + 1..=max_level]
+            .iter()
+            .zip(&self.geometry[level + 1..=max_level])
+            .zip(&self.overflow[level + 1..=max_level])
+            .zip(&self.inverse_node_size[level + 1..=max_level])
+            .rev()
+            .for_each(|(((grid, geometry), overflow), &(inverse_width, inverse_height))| {
+                if geometry.is_empty() {
+                    return;
+                }
+                let grid_width = grid.cols();
+                let grid_height = grid.rows();
+
+                // Cells before the query matter as far as their items extend
+                // forward, cells after it as far as theirs extend backward.
+                // Coordinates are in nodes and a shrink in half nodes, so a
+                // shrink counts half.
+                let [left, right, top, bottom] = overflow.shrink;
+                // Both ends include a node whose items reach exactly to the
+                // query, as in `scan_range`.
+                let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
+                let min_coord_y = first_reaching_node(min_y * inverse_height + bottom * 0.5);
+
+                let max_coord_x =
+                    last_reaching_node(max_x * inverse_width - left * 0.5).min(grid_width - 1);
+                let max_coord_y =
+                    last_reaching_node(max_y * inverse_height - top * 0.5).min(grid_height - 1);
+
+                // Scan the resulting range.
+                for y in min_coord_y..=max_coord_y {
+                    for x in min_coord_x..=max_coord_x {
+                        let node = unsafe { grid.get_unchecked(y, x) };
+                        if node.items.is_empty() {
+                            continue;
+                        }
+
+                        // The range only shrinks with the maxima, so this
+                        // inner part lies within that of the fixed reach.
+                        if y > min_coord_y + 1
+                            && y < max_coord_y - 1
+                            && x > min_coord_x + 1
+                            && x < max_coord_x - 1
+                        {
+                            // The node lies within `bounds`, loose bounds
+                            // included, so its items need no intersection test.
+                            node.pair_all(callback);
+                        } else {
+                            node.pair_with(bounds, callback);
+                        }
+                    }
+                }
+            });
     }
 
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
@@ -631,24 +812,108 @@ impl<T: Copy, const MAX_LEVEL: u8> OverflowBoundGrid<T, MAX_LEVEL> {
 }
 
 struct OverflowBoundGridNode<T: Copy> {
+    /// Union of the bounds of every item in `items`; [`EMPTY`] while there
+    /// are none.
+    bounds: Rectangle,
     items: Vec<Entry<T>>,
 }
 
 impl<T: Copy> OverflowBoundGridNode<T> {
     fn new() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            bounds: EMPTY,
+            items: Vec::new(),
+        }
+    }
+
+    /// Grow the box to cover `bounds`.
+    #[inline]
+    fn grow(&mut self, bounds: &Rectangle) {
+        cover(&mut self.bounds, bounds);
+    }
+
+    /// Whether `bounds`, of an item covered by the box, lies on one of its
+    /// sides, so that the box may shrink without that item.
+    #[inline]
+    fn touches(&self, bounds: &Rectangle) -> bool {
+        let b = &self.bounds;
+        (bounds.min_x == b.min_x)
+            | (bounds.min_y == b.min_y)
+            | (bounds.max_x == b.max_x)
+            | (bounds.max_y == b.max_y)
+    }
+
+    /// Set the box to the union of the bounds of the current items.
+    fn refresh(&mut self) {
+        let Self { bounds, items } = self;
+        *bounds = EMPTY;
+        for entry in items.iter() {
+            cover(bounds, &entry.bounds);
+        }
+    }
+
+    /// Overwrite the bounds of the item at `index` and keep the box exact.
+    #[inline]
+    fn replace_bounds(&mut self, index: usize, bounds: Rectangle) {
+        let old = std::mem::replace(&mut self.items[index].bounds, bounds);
+        if self.touches(&old) {
+            self.refresh();
+        } else {
+            cover(&mut self.bounds, &self.items[index].bounds);
+        }
     }
 
     fn search_items(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        if !self.bounds.intersects(bounds) {
+            return;
+        }
         self.items
             .iter()
             .filter(|entry| entry.bounds.intersects(bounds))
             .for_each(|entry| callback(entry.item));
     }
 
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        if !self.bounds.intersects(bounds) {
+            return;
+        }
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// Test the items after `index` against `bounds`, without the box, which
+    /// covers the item at `index` and thus meets any query it makes.
+    fn pair_with_after(&self, index: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items[index + 1..]
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`iter_items`](Self::iter_items) for the pair queries, a copy so that
+    /// they share no code with the searches.
+    fn pair_all(&self, callback: &mut impl FnMut(T)) {
+        self.items.iter().for_each(|entry| callback(entry.item));
+    }
+
     fn iter_items(&self, callback: &mut impl FnMut(T)) {
         self.items.iter().for_each(|entry| callback(entry.item));
     }
+}
+
+/// Grow `target` to cover `bounds`. A NaN coordinate leaves its side
+/// unchanged, which is harmless: an item with a NaN coordinate intersects no
+/// query.
+#[inline]
+fn cover(target: &mut Rectangle, bounds: &Rectangle) {
+    target.min_x = lower(target.min_x, bounds.min_x);
+    target.min_y = lower(target.min_y, bounds.min_y);
+    target.max_x = higher(target.max_x, bounds.max_x);
+    target.max_y = higher(target.max_y, bounds.max_y);
 }
 
 #[cfg(test)]
@@ -667,7 +932,7 @@ mod tests {
     };
 
     const MAX_LEVEL: u8 = 7;
-    type Tree = OverflowBoundGrid<usize, MAX_LEVEL>;
+    type Tree = ExactOverflowBoundGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
@@ -676,6 +941,46 @@ mod tests {
     ];
 
     crate::grid_tests::exact_reach_tests!();
+    crate::grid_tests::box_helpers!(OverflowBoundGridNode);
+
+    /// Every box must equal the union of the items of its node after any
+    /// insertion, update or removal, also after small updates within the node
+    /// and the removal of the items on its sides.
+    #[test]
+    fn boxes_equal_the_union_of_their_items() {
+        let mut rng = StdRng::seed_from_u64(2);
+        for mut tree in trees() {
+            let mut items: Vec<(ItemHandle, Rectangle)> = Vec::new();
+            for step in 0..4000 {
+                match rng.gen_range(0..5) {
+                    0 | 1 => {
+                        let bounds = random_bounds(&mut rng, &tree);
+                        items.push((tree.insert(bounds.clone(), step), bounds));
+                    }
+                    2 | 3 if !items.is_empty() => {
+                        let index = rng.gen_range(0..items.len());
+                        let (handle, old) = &items[index];
+                        let bounds = if rng.gen_bool(0.7) {
+                            nudge(&mut rng, old)
+                        } else {
+                            random_bounds(&mut rng, &tree)
+                        };
+                        tree.update(bounds.clone(), *handle);
+                        items[index].1 = bounds;
+                    }
+                    _ if !items.is_empty() => {
+                        let (handle, _) = items.swap_remove(rng.gen_range(0..items.len()));
+                        tree.remove(handle);
+                    }
+                    _ => {}
+                }
+                if step % 50 == 0 {
+                    assert_boxes(&tree, true);
+                }
+            }
+            assert_boxes(&tree, true);
+        }
+    }
 
     /// Moves and resizes through `update` must keep every slot and per-level
     /// object count consistent with `position`, also after removals and the
@@ -736,6 +1041,7 @@ mod tests {
 
     fn assert_consistent(tree: &Tree, handles: &[ItemHandle], bounds_of: &[Rectangle]) {
         assert_overflows(tree);
+        assert_boxes(tree, true);
         assert_eq!(tree.slots.len(), handles.len());
         for (item, (handle, bounds)) in handles.iter().zip(bounds_of).enumerate() {
             let location = tree.slots.get(*handle);
@@ -821,7 +1127,7 @@ mod tests {
     #[test]
     fn four_directions_duplicates_and_maximum_removal() {
         // Level 3 has 16-unit nodes; these items sit in the one from 16 to 32.
-        let mut grid = OverflowBoundGrid::<u8, 3>::new(Rectangle::new(0.0, 0.0, 64.0, 64.0));
+        let mut grid = ExactOverflowBoundGrid::<u8, 3>::new(Rectangle::new(0.0, 0.0, 64.0, 64.0));
         let inside = grid.insert(Rectangle::center_rect(24.0, 24.0, 12.0, 12.0), 0);
         assert_eq!(grid.layer_overflow(3).values(), [-2.0; 4]);
         let left_bounds = Rectangle::center_rect(17.0, 24.0, 12.0, 12.0);
@@ -862,7 +1168,7 @@ mod tests {
 
     #[test]
     fn updates_refresh_overflow_in_same_cell_across_cells_and_levels() {
-        let mut grid = OverflowBoundGrid::<u8, 3>::new(Rectangle::new(0.0, 0.0, 64.0, 64.0));
+        let mut grid = ExactOverflowBoundGrid::<u8, 3>::new(Rectangle::new(0.0, 0.0, 64.0, 64.0));
         let handle = grid.insert(Rectangle::center_rect(17.0, 17.0, 12.0, 12.0), 0);
         let cases = [
             (
@@ -924,7 +1230,7 @@ mod tests {
     #[test]
     fn fitted_cells_use_width_and_height_and_root_overflow_is_unbounded() {
         let mut grid =
-            OverflowBoundGrid::<u8, 3>::new_fit(Rectangle::new(-100.0, 200.0, 28.0, 264.0));
+            ExactOverflowBoundGrid::<u8, 3>::new_fit(Rectangle::new(-100.0, 200.0, 28.0, 264.0));
         let handle = grid.insert(Rectangle::center_rect(-67.0, 217.0, 20.0, 12.0), 0);
         assert_eq!(
             grid.position(&Rectangle::center_rect(-67.0, 217.0, 20.0, 12.0)),

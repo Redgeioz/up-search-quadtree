@@ -1,6 +1,6 @@
 //! Bounds on how far items extend beyond their cells, shared by
-//! [`LazyOverflowBoundGrid`], [`BoxedOverflowBoundGrid`],
-//! [`SpanOverflowBoundGrid`] and the other overflow-bound grids.
+//! [`LazyOverflowBoundGrid`], [`SpanOverflowBoundGrid`] and the other
+//! overflow-bound grids.
 //!
 //! Positioning by size keeps every item within half a node of its cell, up
 //! to floating-point rounding, and the hierarchical loose grid always scans
@@ -12,7 +12,6 @@
 //! and bottom (+y).
 //!
 //! [`LazyOverflowBoundGrid`]: crate::LazyOverflowBoundGrid
-//! [`BoxedOverflowBoundGrid`]: crate::BoxedOverflowBoundGrid
 //! [`SpanOverflowBoundGrid`]: crate::SpanOverflowBoundGrid
 
 use crate::rect::Rectangle;
@@ -90,8 +89,8 @@ pub(crate) struct LevelReach {
     /// every item still present.
     pub(crate) reach: [f64; 4],
     /// Multiple of half a node by which search shrinks the fixed reach in
-    /// each direction, kept in step with `reach`. It exceeds one for a
-    /// negative bound, and is exactly zero once the reach plus the slack
+    /// each direction, kept in step with `reach`. It exceeds one once the
+    /// reach plus the slack is negative, and is exactly zero once that sum
     /// covers half a node, so that search then matches the hierarchical loose
     /// grid.
     ///

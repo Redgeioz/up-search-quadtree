@@ -28,7 +28,6 @@
 //! or centered outside the world go to one overflow node that every search
 //! reads.
 //!
-//! [`HaloGrid`]: crate::HaloGrid
 //! [`HaloOverflowBoundGrid`]: crate::HaloOverflowBoundGrid
 //! [`SpanOverflowBoundGrid`]: crate::SpanOverflowBoundGrid
 //! [`SpanGrid`]: crate::SpanGrid
@@ -348,6 +347,28 @@ impl<T: Copy> HaloGrid<T> {
         }
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. An item in a
+    /// cell reads only the items after it in its cell and the cells after its
+    /// own in row-major order, that is the neighbor to the right and those in
+    /// the row below, where a search with its bounds would read them, and the
+    /// overflow node; the items of the overflow node pair up with the
+    /// overflow items after them. The cells are visited in Morton order.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let cells = &self.cells;
+        for_each_cell_in_morton_order(cells.cols(), cells.rows(), |x, y| {
+            for (index, entry) in cells[y][x].items.iter().enumerate() {
+                let mut report = |found| callback(entry.item, found);
+                self.pair_half_stencil((x, y), index, &entry.bounds, &mut report);
+                self.overflow.pair_with(&entry.bounds, &mut report);
+            }
+        });
+        for (index, entry) in self.overflow.items.iter().enumerate() {
+            let mut report = |found| callback(entry.item, found);
+            self.overflow.pair_with_after(index, &entry.bounds, &mut report);
+        }
+    }
+
     /// Search the grid and execute the callback for each item whose bounds
     /// intersect `bounds`.
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
@@ -369,6 +390,74 @@ impl<T: Copy> HaloGrid<T> {
     /// reach the query, judged by the cell's copies, or, while those may be
     /// behind the boxes, by the spans. For queries no larger than a cell.
     #[inline]
+    /// Search the half stencil of [`for_each_pair`]: cell `(x, y)` after its
+    /// item `start`, and of the neighbors after it in row-major order those
+    /// that `walk_3x3` would visit for `bounds`, by the copies or, near a
+    /// touched row of a stale grid, by the spans.
+    ///
+    /// [`for_each_pair`]: Self::for_each_pair
+    fn pair_half_stencil(
+        &self,
+        (x, y): (usize, usize),
+        start: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        if self.lines.stale && self.lines.near_touched(y) {
+            let grid = &self.cells;
+            let lines = &self.lines;
+            let (cols, rows) = (grid.cols(), grid.rows());
+            // SAFETY: `(x, y)` is a cell, the clamped line indices are in bounds,
+            // and each neighbor is read only after the test that it exists.
+            unsafe {
+                let below = lines.rows.get_unchecked((y + 1).min(rows - 1))[0];
+                let left_of = lines.columns.get_unchecked(x.saturating_sub(1))[1];
+                let right_of = lines.columns.get_unchecked((x + 1).min(cols - 1))[0];
+                let down = (y + 1 != rows) & (bounds.max_y > below);
+                let before = (x != 0) & (bounds.min_x < left_of);
+                let after = (x + 1 != cols) & (bounds.max_x > right_of);
+                grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+                if after {
+                    grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+                }
+                if down {
+                    if before {
+                        grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+                    }
+                    grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+                    if after {
+                        grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+                    }
+                }
+            }
+        } else {
+            let grid = &self.cells;
+            // SAFETY: as in `walk_3x3_by_copies`.
+            unsafe {
+                let halo = self.halo.get_unchecked(y * grid.cols() + x);
+                let after = bounds.max_x > halo.right;
+                let down = bounds.max_y > halo.bottom;
+                let down_before = (bounds.min_x < halo.bottom_left[0])
+                    & (bounds.max_y > halo.bottom_left[1]);
+                let down_after = (bounds.max_x > halo.bottom_right[0])
+                    & (bounds.max_y > halo.bottom_right[1]);
+                grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+                if after {
+                    grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+                }
+                if down_before {
+                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+                }
+                if down {
+                    grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+                }
+                if down_after {
+                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+                }
+            }
+        }
+    }
+
     fn walk_3x3<'a>(&'a self, bounds: &Rectangle, visit: impl FnMut(&'a Node<T>)) {
         let (x, y) = self.cell_containing(bounds.get_center());
         // Copies can be behind only after a store, and then only near a
@@ -775,6 +864,27 @@ impl<T: Copy> Node<T> {
             return;
         }
         self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        if !self.bounds.intersects(bounds) {
+            return;
+        }
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// Test the items after `index` against `bounds`, without the box, which
+    /// covers the item at `index` and thus meets any query it makes.
+    fn pair_with_after(&self, index: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items[index + 1..]
             .iter()
             .filter(|entry| entry.bounds.intersects(bounds))
             .for_each(|entry| callback(entry.item));

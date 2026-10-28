@@ -217,6 +217,32 @@ impl<T: Copy> UniformGrid<T> {
         });
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. Two items share
+    /// every cell where their ranges overlap; the pair is tested only in the
+    /// first of those, as in reference-point duplicate avoidance, so the
+    /// first-cell check on the memberships precedes reading the objects. The
+    /// cells are visited in Morton order.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let cols = self.cols;
+        for_each_cell_in_morton_order(cols, self.rows, |x, y| {
+            let cell = &self.cells[y * cols + x];
+            for (index, a) in cell.iter().enumerate() {
+                let object = &self.objects[a.object as usize];
+                for b in &cell[index + 1..] {
+                    let first_common = a.first_x.max(b.first_x) as usize == x
+                        && a.first_y.max(b.first_y) as usize == y;
+                    if first_common {
+                        let other = &self.objects[b.object as usize];
+                        if object.bounds.intersects(&other.bounds) {
+                            callback(object.item, other.item);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Call `callback` once for every item whose bounds intersect `bounds`.
     ///
     /// Panics if the max x of `bounds` falls two or more columns before its

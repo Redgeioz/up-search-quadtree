@@ -8,6 +8,9 @@ const MAX_LEVEL: u8 = 7;
 const MAX_ITEMS: usize = 8;
 /// Cell size of the uniform grid, a few times the usual ball diameter.
 const UNIFORM_CELL_SIZE: f64 = 32.0;
+/// Cell sizes of the `MultiGrid` collections: three log-spaced classes over
+/// the ball diameters, the largest balls going to its overflow list.
+const MULTI_CELL_SIZES: [f64; 3] = [16.0, 128.0, 1024.0];
 
 const BOUND_WIDTH: f64 = 1024.0;
 const BOUND_HEIGHT: f64 = 512.0;
@@ -59,12 +62,15 @@ struct Trees {
     loose: LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>,
     hierarchical_loose: HierarchicalLooseGrid<usize, MAX_LEVEL>,
     uniform: UniformGrid<usize>,
+    two_layer: TwoLayerGrid<usize>,
+    multi: MultiGrid<usize>,
     hierarchical: HierarchicalGrid<usize, MAX_LEVEL>,
-    overflow_bound: OverflowBoundGrid<usize, MAX_LEVEL>,
+    overflow_bound: ExactOverflowBoundGrid<usize, MAX_LEVEL>,
+    boxed_loose: BoxedLooseGrid<usize, MAX_LEVEL>,
     lazy: LazyOverflowBoundGrid<usize, MAX_LEVEL>,
-    boxed: BoxedOverflowBoundGrid<usize, MAX_LEVEL>,
     span: SpanOverflowBoundGrid<usize, MAX_LEVEL>,
     halo: HaloOverflowBoundGrid<usize, MAX_LEVEL>,
+    sweep: SortAndSweep<usize>,
 }
 
 /// Handles of one ball in every structure.
@@ -73,12 +79,15 @@ struct Handles {
     loose: ItemHandle,
     hierarchical_loose: ItemHandle,
     uniform: ItemHandle,
+    two_layer: ItemHandle,
+    multi: ItemHandle,
     hierarchical: ItemHandle,
     overflow_bound: ItemHandle,
+    boxed_loose: ItemHandle,
     lazy: ItemHandle,
-    boxed: ItemHandle,
     span: ItemHandle,
     halo: ItemHandle,
+    sweep: ItemHandle,
 }
 
 impl Trees {
@@ -87,12 +96,15 @@ impl Trees {
             loose: LooseQuadTree::new(world.clone()),
             hierarchical_loose: HierarchicalLooseGrid::new(world.clone()),
             uniform: UniformGrid::new(world.clone(), UNIFORM_CELL_SIZE),
+            two_layer: TwoLayerGrid::new(world.clone(), UNIFORM_CELL_SIZE),
+            multi: MultiGrid::new(world.clone(), &MULTI_CELL_SIZES),
             hierarchical: HierarchicalGrid::new(world.clone()),
-            overflow_bound: OverflowBoundGrid::new(world.clone()),
+            overflow_bound: ExactOverflowBoundGrid::new(world.clone()),
+            boxed_loose: BoxedLooseGrid::new(world.clone()),
             lazy: LazyOverflowBoundGrid::new(world.clone()),
-            boxed: BoxedOverflowBoundGrid::new(world.clone()),
             span: SpanOverflowBoundGrid::new(world.clone()),
             halo: HaloOverflowBoundGrid::new(world.clone()),
+            sweep: SortAndSweep::new(),
         }
     }
 
@@ -101,12 +113,15 @@ impl Trees {
             loose: self.loose.insert(bounds.clone(), id),
             hierarchical_loose: self.hierarchical_loose.insert(bounds.clone(), id),
             uniform: self.uniform.insert(bounds.clone(), id),
+            two_layer: self.two_layer.insert(bounds.clone(), id),
+            multi: self.multi.insert(bounds.clone(), id),
             hierarchical: self.hierarchical.insert(bounds.clone(), id),
             overflow_bound: self.overflow_bound.insert(bounds.clone(), id),
+            boxed_loose: self.boxed_loose.insert(bounds.clone(), id),
             lazy: self.lazy.insert(bounds.clone(), id),
-            boxed: self.boxed.insert(bounds.clone(), id),
             span: self.span.insert(bounds.clone(), id),
             halo: self.halo.insert(bounds.clone(), id),
+            sweep: self.sweep.insert(bounds.clone(), id),
         }
     }
 
@@ -114,35 +129,42 @@ impl Trees {
         self.loose.update(bounds.clone(), handles.loose);
         self.hierarchical_loose.update(bounds.clone(), handles.hierarchical_loose);
         self.uniform.update(bounds.clone(), handles.uniform);
+        self.two_layer.update(bounds.clone(), handles.two_layer);
+        self.multi.update(bounds.clone(), handles.multi);
         self.hierarchical.update(bounds.clone(), handles.hierarchical);
         self.overflow_bound
             .update(bounds.clone(), handles.overflow_bound);
+        self.boxed_loose.update(bounds.clone(), handles.boxed_loose);
         self.lazy.update(bounds.clone(), handles.lazy);
-        self.boxed.update(bounds.clone(), handles.boxed);
         self.span
             .update(bounds.clone(), handles.span);
         self.halo
             .update(bounds.clone(), handles.halo);
+        self.sweep.update(bounds.clone(), handles.sweep);
     }
 
     fn remove(&mut self, handles: Handles) {
         self.loose.remove(handles.loose);
         self.hierarchical_loose.remove(handles.hierarchical_loose);
         self.uniform.remove(handles.uniform);
+        self.two_layer.remove(handles.two_layer);
+        self.multi.remove(handles.multi);
         self.hierarchical.remove(handles.hierarchical);
         self.overflow_bound.remove(handles.overflow_bound);
+        self.boxed_loose.remove(handles.boxed_loose);
         self.lazy.remove(handles.lazy);
-        self.boxed.remove(handles.boxed);
         self.span.remove(handles.span);
         self.halo.remove(handles.halo);
+        self.sweep.remove(handles.sweep);
     }
 
     /// Tighten the bounds that shrink only on request.
     fn refresh(&mut self) {
+        self.boxed_loose.refresh_bounds();
         self.lazy.refresh_bounds();
-        self.boxed.refresh_bounds();
         self.span.refresh_bounds();
         self.halo.refresh_bounds();
+        self.sweep.refresh_order();
     }
 
     /// Items that each structure's search finds for `bounds`, excluding `id`.
@@ -161,20 +183,28 @@ impl Trees {
                 collect(id, |cb| self.uniform.search(bounds, cb)),
             ),
             (
+                "TwoLayerGrid",
+                collect(id, |cb| self.two_layer.search(bounds, cb)),
+            ),
+            (
+                "MultiGrid",
+                collect(id, |cb| self.multi.search(bounds, cb)),
+            ),
+            (
                 "HierarchicalGrid",
                 collect(id, |cb| self.hierarchical.search(bounds, cb)),
             ),
             (
-                "OverflowBoundGrid",
+                "ExactOverflowBoundGrid",
                 collect(id, |cb| self.overflow_bound.search(bounds, cb)),
+            ),
+            (
+                "BoxedLooseGrid",
+                collect(id, |cb| self.boxed_loose.search(bounds, cb)),
             ),
             (
                 "LazyOverflowBoundGrid",
                 collect(id, |cb| self.lazy.search(bounds, cb)),
-            ),
-            (
-                "BoxedOverflowBoundGrid",
-                collect(id, |cb| self.boxed.search(bounds, cb)),
             ),
             (
                 "SpanOverflowBoundGrid",
@@ -183,6 +213,10 @@ impl Trees {
             (
                 "HaloOverflowBoundGrid",
                 collect(id, |cb| self.halo.search(bounds, cb)),
+            ),
+            (
+                "SortAndSweep",
+                collect(id, |cb| self.sweep.search(bounds, cb)),
             ),
         ]
     }
@@ -380,14 +414,17 @@ fn structures_are_send_and_sync() {
     assert_send_sync::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>();
     assert_send_sync::<HierarchicalLooseGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<UniformGrid<usize>>();
+    assert_send_sync::<TwoLayerGrid<usize>>();
+    assert_send_sync::<MultiGrid<usize>>();
     assert_send_sync::<HierarchicalGrid<usize, MAX_LEVEL>>();
-    assert_send_sync::<OverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>();
+    assert_send_sync::<BoxedLooseGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>();
-    assert_send_sync::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>();
     assert_send_sync::<SpanGrid<usize>>();
     assert_send_sync::<HaloGrid<usize>>();
+    assert_send_sync::<SortAndSweep<usize>>();
 }
 
 /// A `MAX_LEVEL` of zero, or one whose finest level has more cells than
@@ -409,12 +446,12 @@ rejects_max_level!(
     hierarchical_loose_grid_rejects_level_65: HierarchicalLooseGrid::<usize, 65>::new(world()), "too large";
     hierarchical_grid_rejects_level_zero: HierarchicalGrid::<usize, 0>::new(world()), "cannot be zero";
     hierarchical_grid_rejects_level_65: HierarchicalGrid::<usize, 65>::new(world()), "too large";
-    overflow_bound_grid_rejects_level_zero: OverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
-    overflow_bound_grid_rejects_level_65: OverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    exact_grid_rejects_level_zero: ExactOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
+    exact_grid_rejects_level_65: ExactOverflowBoundGrid::<usize, 65>::new(world()), "too large";
+    boxed_loose_grid_rejects_level_zero: BoxedLooseGrid::<usize, 0>::new(world()), "cannot be zero";
+    boxed_loose_grid_rejects_level_65: BoxedLooseGrid::<usize, 65>::new(world()), "too large";
     lazy_grid_rejects_level_zero: LazyOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
     lazy_grid_rejects_level_65: LazyOverflowBoundGrid::<usize, 65>::new(world()), "too large";
-    boxed_grid_rejects_level_zero: BoxedOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
-    boxed_grid_rejects_level_65: BoxedOverflowBoundGrid::<usize, 65>::new(world()), "too large";
     span_grid_rejects_level_zero: SpanOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
     span_grid_rejects_level_65: SpanOverflowBoundGrid::<usize, 65>::new(world()), "too large";
     halo_grid_rejects_level_zero: HaloOverflowBoundGrid::<usize, 0>::new(world()), "cannot be zero";
@@ -475,9 +512,9 @@ macro_rules! new_or_fit {
     };
 }
 new_or_fit!(
-    OverflowBoundGrid,
+    ExactOverflowBoundGrid,
+    BoxedLooseGrid: refresh_bounds,
     LazyOverflowBoundGrid: refresh_bounds,
-    BoxedOverflowBoundGrid: refresh_bounds,
     SpanOverflowBoundGrid: refresh_bounds,
     HaloOverflowBoundGrid: refresh_bounds,
 );
@@ -677,9 +714,9 @@ fn check_tight_bounds<Tree: OverflowBounded>(name: &str) {
 /// find every item, including items that overlap a query by a single float.
 #[test]
 fn check_tight_overflow_bounds() {
-    check_tight_bounds::<OverflowBoundGrid<usize, MAX_LEVEL>>("OverflowBoundGrid");
+    check_tight_bounds::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_tight_bounds::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
     check_tight_bounds::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
-    check_tight_bounds::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>("BoxedOverflowBoundGrid");
     check_tight_bounds::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>(
         "SpanOverflowBoundGrid",
     );
@@ -687,6 +724,10 @@ fn check_tight_overflow_bounds() {
         "HaloOverflowBoundGrid",
     );
     check_tight_bounds::<HaloGrid<usize>>("HaloGrid");
+    // Its skipped tests rely on the cell ranges alone; items reaching across
+    // a cell edge by a single float test that reasoning.
+    check_tight_bounds::<TwoLayerGrid<usize>>("TwoLayerGrid");
+    check_tight_bounds::<MultiGrid<usize>>("MultiGrid");
     // Without bounds the ancestor walk and HG's scans decide from the query's
     // corners which neighbors to read; items reaching across an edge by a
     // single float test those decisions.
@@ -757,9 +798,9 @@ fn check_sparse_levels<Tree: OverflowBounded>(name: &str) {
 /// one that does.
 #[test]
 fn check_sparse_levels_keep_searches_exact() {
-    check_sparse_levels::<OverflowBoundGrid<usize, MAX_LEVEL>>("OverflowBoundGrid");
+    check_sparse_levels::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_sparse_levels::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
     check_sparse_levels::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
-    check_sparse_levels::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>("BoxedOverflowBoundGrid");
     check_sparse_levels::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>(
         "SpanOverflowBoundGrid",
     );
@@ -841,9 +882,9 @@ fn scans_reach_items_past_their_reach_by_a_float() {
     }
     cases!(
         HierarchicalLooseGrid,
-        OverflowBoundGrid,
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
         LazyOverflowBoundGrid,
-        BoxedOverflowBoundGrid,
         SpanOverflowBoundGrid,
         HaloOverflowBoundGrid
     );
@@ -914,9 +955,9 @@ fn walks_read_neighbors_that_a_query_ends_at() {
     }
     cases!(
         HierarchicalLooseGrid,
-        OverflowBoundGrid,
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
         LazyOverflowBoundGrid,
-        BoxedOverflowBoundGrid,
         SpanOverflowBoundGrid,
         HaloOverflowBoundGrid
     );
@@ -1028,9 +1069,9 @@ fn check_sparse_levels_with_few_levels() {
         )*};
     }
     few_levels!(
-        OverflowBoundGrid,
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
         LazyOverflowBoundGrid,
-        BoxedOverflowBoundGrid,
         SpanOverflowBoundGrid,
         HaloOverflowBoundGrid,
         HierarchicalLooseGrid
@@ -1044,6 +1085,22 @@ impl OverflowBounded for UniformGrid<usize> {
     fn create(world: Rectangle, _fit: bool) -> Self {
         let cell_size = finest_cell_size(&world);
         Self::new(world, cell_size)
+    }
+    forward_items!();
+}
+
+impl OverflowBounded for TwoLayerGrid<usize> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        let cell_size = finest_cell_size(&world);
+        Self::new(world, cell_size)
+    }
+    forward_items!();
+}
+
+impl OverflowBounded for MultiGrid<usize> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        let cell_size = finest_cell_size(&world);
+        Self::new(world, &[cell_size, cell_size * 4.0, cell_size * 16.0])
     }
     forward_items!();
 }
@@ -1080,14 +1137,16 @@ macro_rules! self_query {
     };
 }
 self_query!(
-    OverflowBoundGrid<usize, MAX_LEVEL>,
+    ExactOverflowBoundGrid<usize, MAX_LEVEL>,
+    BoxedLooseGrid<usize, MAX_LEVEL>,
     LazyOverflowBoundGrid<usize, MAX_LEVEL>,
-    BoxedOverflowBoundGrid<usize, MAX_LEVEL>,
     SpanOverflowBoundGrid<usize, MAX_LEVEL>,
     HaloOverflowBoundGrid<usize, MAX_LEVEL>,
     HierarchicalLooseGrid<usize, MAX_LEVEL>,
     HierarchicalGrid<usize, MAX_LEVEL>,
     UniformGrid<usize>,
+    TwoLayerGrid<usize>,
+    MultiGrid<usize>,
     SpanGrid<usize>,
     HaloGrid<usize>
 );
@@ -1195,16 +1254,231 @@ fn check_self_query<Tree: OverflowBounded + SelfQuery>(name: &str) {
     }
 }
 
+/// Structures that report every intersecting pair of distinct items once.
+trait PairQuery {
+    fn pairs(&self, callback: &mut dyn FnMut(usize, usize));
+}
+
+macro_rules! pair_query {
+    ($($t:ty),*) => {
+        $(impl PairQuery for $t {
+            fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+                self.for_each_pair(|a, b| callback(a, b));
+            }
+        })*
+    };
+}
+pair_query!(
+    ExactOverflowBoundGrid<usize, MAX_LEVEL>,
+    LazyOverflowBoundGrid<usize, MAX_LEVEL>,
+    SpanOverflowBoundGrid<usize, MAX_LEVEL>,
+    HaloOverflowBoundGrid<usize, MAX_LEVEL>,
+    MultiGrid<usize>,
+    HierarchicalLooseGrid<usize, MAX_LEVEL>,
+    BoxedLooseGrid<usize, MAX_LEVEL>,
+    HierarchicalGrid<usize, MAX_LEVEL>,
+    UniformGrid<usize>,
+    TwoLayerGrid<usize>,
+    SpanGrid<usize>,
+    HaloGrid<usize>,
+    LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>
+);
+
+impl<const L: u8, const M: usize> OverflowBounded for LooseQuadTree<usize, L, M> {
+    fn create(world: Rectangle, fit: bool) -> Self {
+        if fit {
+            Self::new_fit(world)
+        } else {
+            Self::new(world)
+        }
+    }
+    forward_items!();
+}
+
+/// `SortAndSweep`, which needs no world, with the world of the pair check as
+/// its root; `SCALAR` picks the scalar sweep for its pairs.
+struct Sweep<const SCALAR: bool> {
+    sweep: SortAndSweep<usize>,
+    world: Rectangle,
+}
+
+impl<const SCALAR: bool> OverflowBounded for Sweep<SCALAR> {
+    fn create(world: Rectangle, _fit: bool) -> Self {
+        Self {
+            sweep: SortAndSweep::new(),
+            world,
+        }
+    }
+    fn root(&self) -> Rectangle {
+        self.world.clone()
+    }
+    fn insert_item(&mut self, bounds: Rectangle, id: usize) -> ItemHandle {
+        self.sweep.insert(bounds, id)
+    }
+    fn update_item(&mut self, bounds: Rectangle, handle: ItemHandle) {
+        self.sweep.update(bounds, handle);
+    }
+    fn remove_item(&mut self, handle: ItemHandle) {
+        self.sweep.remove(handle);
+    }
+    fn search_items(&self, bounds: &Rectangle, callback: &mut dyn FnMut(usize)) {
+        self.sweep.search(bounds, callback);
+    }
+    fn refresh(&mut self) {
+        self.sweep.refresh_order();
+    }
+}
+
+impl<const SCALAR: bool> PairQuery for Sweep<SCALAR> {
+    fn pairs(&self, callback: &mut dyn FnMut(usize, usize)) {
+        if SCALAR {
+            self.sweep.for_each_pair_scalar(|a, b| callback(a, b));
+        } else {
+            self.sweep.for_each_pair(|a, b| callback(a, b));
+        }
+    }
+}
+
+/// Every pair of distinct live items whose bounds intersect must be reported
+/// exactly once, in either order, and no other pair; a duplicate or an item
+/// paired with itself shows up as an extra entry.
+fn assert_pairs_match_brute_force(
+    tree: &(impl PairQuery + OverflowBounded),
+    items: &[Option<(ItemHandle, Rectangle)>],
+    context: &str,
+) {
+    let live: Vec<(usize, &Rectangle)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(id, item)| item.as_ref().map(|(_, bounds)| (id, bounds)))
+        .collect();
+    let mut expected = Vec::new();
+    for (i, &(a, a_bounds)) in live.iter().enumerate() {
+        for &(b, b_bounds) in &live[i + 1..] {
+            if a_bounds.intersects(b_bounds) {
+                expected.push((a.min(b), a.max(b)));
+            }
+        }
+    }
+    let mut reported = Vec::new();
+    tree.pairs(&mut |a, b| reported.push((a.min(b), a.max(b))));
+    expected.sort_unstable();
+    reported.sort_unstable();
+    assert_eq!(reported, expected, "{context}");
+}
+
+/// As `check_self_query`, for the pairs: random tight items, odd items, then
+/// rounds of updates, removals and insertions, checked stale and refreshed.
+fn check_pairs<Tree: OverflowBounded + PairQuery>(name: &str) {
+    let mut rng = StdRng::seed_from_u64(17);
+    for (world, fit) in SELF_QUERY_WORLDS.into_iter().flat_map(|world| [(world.clone(), false), (world, true)]) {
+        let context = format!("{name}, world {world:?}, fit {fit}");
+        let mut tree = Tree::create(world.clone(), fit);
+        let root = tree.root();
+        let mut items: Vec<Option<(ItemHandle, Rectangle)>> = (0..300)
+            .map(|id| {
+                let bounds = tight_item(&mut rng, &root, &world, 0.1);
+                Some((tree.insert_item(bounds.clone(), id), bounds))
+            })
+            .collect();
+        for bounds in odd_items(&mut rng, &root, &world) {
+            let handle = tree.insert_item(bounds.clone(), items.len());
+            items.push(Some((handle, bounds)));
+        }
+        assert_pairs_match_brute_force(&tree, &items, &context);
+        for round in 0..3 {
+            for (handle, bounds) in items.iter_mut().flatten() {
+                if rng.gen_bool(0.5) {
+                    *bounds = tight_item(&mut rng, &root, &world, 0.1);
+                    tree.update_item(bounds.clone(), *handle);
+                }
+            }
+            for _ in 0..30 {
+                let id = rng.gen_range(0..items.len());
+                if let Some((handle, _)) = items[id].take() {
+                    tree.remove_item(handle);
+                }
+            }
+            for _ in 0..20 {
+                let bounds = tight_item(&mut rng, &root, &world, 0.1);
+                let handle = tree.insert_item(bounds.clone(), items.len());
+                items.push(Some((handle, bounds)));
+            }
+            let context = format!("{context}, round {round}");
+            assert_pairs_match_brute_force(&tree, &items, &format!("{context}, stale"));
+            tree.refresh();
+            assert_pairs_match_brute_force(&tree, &items, &format!("{context}, refreshed"));
+        }
+
+        // Items a fraction of a finest cell large, packed into 8 by 8 cells, so
+        // that every node and neighbor direction holds intersecting pairs.
+        let cell = finest_cell_size(&world);
+        let (x0, y0) = world.get_min();
+        let area = Rectangle::new(x0 + 2.0 * cell, y0 + 2.0 * cell, x0 + 10.0 * cell, y0 + 10.0 * cell);
+        let dense = |rng: &mut StdRng| {
+            let (x, y) = area.get_random_point(rng);
+            let (w, h) = (cell * rng.gen_range(0.2..0.95), cell * rng.gen_range(0.2..0.95));
+            Rectangle::center_rect(x, y, w, h)
+        };
+        for _ in 0..400 {
+            let bounds = dense(&mut rng);
+            let handle = tree.insert_item(bounds.clone(), items.len());
+            items.push(Some((handle, bounds)));
+        }
+        let context = format!("{context}, dense");
+        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, stale"));
+        tree.refresh();
+        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, refreshed"));
+        for (handle, bounds) in items.iter_mut().flatten() {
+            if rng.gen_bool(0.5) {
+                let (x, y) = bounds.get_center();
+                let step = cell * 0.3;
+                *bounds = Rectangle::center_rect(
+                    x + rng.gen_range(-step..step),
+                    y + rng.gen_range(-step..step),
+                    bounds.get_width(),
+                    bounds.get_height(),
+                );
+                tree.update_item(bounds.clone(), *handle);
+            }
+        }
+        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, moved, stale"));
+        tree.refresh();
+        assert_pairs_match_brute_force(&tree, &items, &format!("{context}, moved, refreshed"));
+    }
+}
+
+#[test]
+fn pairs_match_brute_force() {
+    check_pairs::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_pairs::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
+    check_pairs::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
+    check_pairs::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
+    check_pairs::<MultiGrid<usize>>("MultiGrid");
+    check_pairs::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
+    check_pairs::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
+    check_pairs::<HierarchicalGrid<usize, MAX_LEVEL>>("HierarchicalGrid");
+    check_pairs::<UniformGrid<usize>>("UniformGrid");
+    check_pairs::<TwoLayerGrid<usize>>("TwoLayerGrid");
+    check_pairs::<SpanGrid<usize>>("SpanGrid");
+    check_pairs::<HaloGrid<usize>>("HaloGrid");
+    check_pairs::<LooseQuadTree<usize, MAX_LEVEL, MAX_ITEMS>>("LooseQuadTree");
+    check_pairs::<Sweep<false>>("SortAndSweep");
+    check_pairs::<Sweep<true>>("SortAndSweep, scalar");
+}
+
 #[test]
 fn self_queries_match_brute_force() {
-    check_self_query::<OverflowBoundGrid<usize, MAX_LEVEL>>("OverflowBoundGrid");
+    check_self_query::<ExactOverflowBoundGrid<usize, MAX_LEVEL>>("ExactOverflowBoundGrid");
+    check_self_query::<BoxedLooseGrid<usize, MAX_LEVEL>>("BoxedLooseGrid");
     check_self_query::<LazyOverflowBoundGrid<usize, MAX_LEVEL>>("LazyOverflowBoundGrid");
-    check_self_query::<BoxedOverflowBoundGrid<usize, MAX_LEVEL>>("BoxedOverflowBoundGrid");
     check_self_query::<SpanOverflowBoundGrid<usize, MAX_LEVEL>>("SpanOverflowBoundGrid");
     check_self_query::<HaloOverflowBoundGrid<usize, MAX_LEVEL>>("HaloOverflowBoundGrid");
     check_self_query::<HierarchicalLooseGrid<usize, MAX_LEVEL>>("HierarchicalLooseGrid");
     check_self_query::<HierarchicalGrid<usize, MAX_LEVEL>>("HierarchicalGrid");
     check_self_query::<UniformGrid<usize>>("UniformGrid");
+    check_self_query::<TwoLayerGrid<usize>>("TwoLayerGrid");
+    check_self_query::<MultiGrid<usize>>("MultiGrid");
     check_self_query::<SpanGrid<usize>>("SpanGrid");
     check_self_query::<HaloGrid<usize>>("HaloGrid");
 }
@@ -1270,9 +1544,9 @@ macro_rules! check_size_levels {
 fn positions_follow_the_size_levels() {
     check_size_levels!(
         HierarchicalLooseGrid,
-        OverflowBoundGrid,
+        ExactOverflowBoundGrid,
+        BoxedLooseGrid,
         LazyOverflowBoundGrid,
-        BoxedOverflowBoundGrid,
         SpanOverflowBoundGrid,
         HaloOverflowBoundGrid
     );

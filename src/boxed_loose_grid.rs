@@ -3,49 +3,40 @@ use crate::cell_order::for_each_cell_hierarchically;
 use crate::layer_geometry::{
     LayerGeometry, Levels, build_levels, first_reaching_node, last_reaching_node, size_level,
 };
-use crate::overflow_bound_grid::DirectionalOverflow;
-use crate::overflow_bound::{LevelReach, cell_overflow, higher, lower, rounding_slack};
+use crate::overflow_bound::{higher, lower};
 use crate::rect::{EMPTY, Rectangle};
 use grid::*;
 
 /// (level, x, y)
 type Coord = (usize, usize, usize);
-type Layers<T> = Vec<Grid<BoxedOverflowBoundGridNode<T>>>;
+type Layers<T> = Vec<Grid<BoxedLooseGridNode<T>>>;
 
-/// Overflow-bound grid with lazy per-node boxes: the storage, positioning and
-/// handles of [`HierarchicalLooseGrid`], where every node also keeps a box
-/// covering the bounds of its items, and every level a bound per direction on
-/// how far its items extend beyond their cells, as in
-/// [`LazyOverflowBoundGrid`]. Search shrinks the fixed reach (half a node) to
-/// that bound to select candidate nodes, which excludes whole neighboring
-/// rows and columns without reading them, and skips a node whose box misses
-/// the query without reading its items.
+/// Hierarchical loose grid with lazy per-node boxes:
+/// [`LazyOverflowBoundGrid`] without its per-level bounds. The storage,
+/// positioning and handles are those of [`HierarchicalLooseGrid`], and every
+/// node also keeps a box covering the bounds of its items. Search selects
+/// candidate nodes with the fixed reach (half a node) of the hierarchical
+/// loose grid and skips a node whose box misses the query without reading its
+/// items.
 ///
-/// As in the lazy grid, a bound may be negative: when every item of a level
-/// stays inside its cell edge in some direction, search enters a cell across
-/// that edge only where the query crosses the edge by more than the smallest
-/// such gap, less the rounding margin.
-///
-/// Insertion and update only grow the box of the target node and the bound
-/// of its level, with one comparison per side. Removal and moving out leave
-/// both unchanged, except that a node left without items resets its box.
-/// Boxes and bounds therefore remain valid as items move, shrink or leave,
-/// and tighten only in [`refresh_bounds`], at a time the caller chooses, e.g.
-/// once per frame after the updates. A stale bound never costs more than the
-/// fixed reach, and the boxes still apply.
+/// Insertion and update only grow the box of the target node, with one
+/// comparison per side. Removal and moving out leave it unchanged, except
+/// that a node left without items resets its box. Boxes therefore remain
+/// valid as items move, shrink or leave, and tighten only in
+/// [`refresh_bounds`], at a time the caller chooses, e.g. once per frame
+/// after the updates.
 ///
 /// The ancestor walk also stops at the coarsest level below the root that
 /// holds items, which a bitmask of the occupied levels keeps exact at all
 /// times.
 ///
 /// Boxes consist of item coordinates, so their tests compare the same values
-/// as the intersection tests and need no rounding margin; the level bounds
-/// use the rounding margin of the lazy grid.
+/// as the intersection tests and need no rounding margin.
 ///
-/// [`HierarchicalLooseGrid`]: crate::HierarchicalLooseGrid
 /// [`LazyOverflowBoundGrid`]: crate::LazyOverflowBoundGrid
+/// [`HierarchicalLooseGrid`]: crate::HierarchicalLooseGrid
 /// [`refresh_bounds`]: Self::refresh_bounds
-pub struct BoxedOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
+pub struct BoxedLooseGrid<T: Copy, const MAX_LEVEL: u8> {
     layers: Layers<T>,
     /// Indexed by level, parallel to `layers`.
     geometry: Vec<LayerGeometry>,
@@ -53,29 +44,23 @@ pub struct BoxedOverflowBoundGrid<T: Copy, const MAX_LEVEL: u8> {
     /// and search multiply by them instead of dividing by the node size, and
     /// `geometry` builds its cell edges with the same arithmetic.
     inverse_node_size: Vec<(f64, f64)>,
-    /// Indexed by level, parallel to `layers`.
-    reach: Vec<LevelReach>,
     /// Bit `L` is set while level `L` holds items: storing an item sets the
     /// bit of its level, and taking the last item off a level clears it. The
     /// coarsest level below the root that holds items, where the ancestor walk
     /// of search stops, is therefore exact at all times, not only after a
-    /// refresh. With all items on the finest level, stopping the walk there
-    /// measured 10% faster than walking every level.
+    /// refresh.
     occupied_levels: u64,
-    /// Rounding margin that search adds to every level bound, since its cell
-    /// edges accumulate rounding differently from [`cell_overflow`].
-    slack: f64,
     root_bounds: Rectangle,
     world_bounds: Rectangle,
     /// Where the entry of each live handle is stored.
     slots: Slots<GridLocation>,
 }
 
-impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
+impl<T: Copy, const MAX_LEVEL: u8> BoxedLooseGrid<T, MAX_LEVEL> {
     /// Create a new grid with the given bounds.
     ///
     /// Every node is square, which usually makes search more efficient.
-    pub fn new(world_bounds: Rectangle) -> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new(world_bounds: Rectangle) -> BoxedLooseGrid<T, MAX_LEVEL> {
         Self::create::<false>(world_bounds)
     }
 
@@ -83,33 +68,23 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
     ///
     /// The nodes take the aspect ratio of the given bounds instead of being
     /// square.
-    pub fn new_fit(world_bounds: Rectangle) -> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
+    pub fn new_fit(world_bounds: Rectangle) -> BoxedLooseGrid<T, MAX_LEVEL> {
         Self::create::<true>(world_bounds)
     }
 
-    fn create<const FIT: bool>(world_bounds: Rectangle) -> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
+    fn create<const FIT: bool>(world_bounds: Rectangle) -> BoxedLooseGrid<T, MAX_LEVEL> {
         let Levels {
             layers,
             root_bounds,
             geometry,
             inverse_node_size,
-        } = build_levels::<_, FIT>(&world_bounds, MAX_LEVEL, BoxedOverflowBoundGridNode::new);
+        } = build_levels::<_, FIT>(&world_bounds, MAX_LEVEL, BoxedLooseGridNode::new);
 
-        let slack = rounding_slack(&root_bounds);
-        // The root bound grows like any other but is never read, since search
-        // scans the root entirely.
-        let reach = geometry
-            .iter()
-            .map(|geometry| LevelReach::new(geometry.node_width, geometry.node_height, slack))
-            .collect();
-
-        BoxedOverflowBoundGrid {
+        BoxedLooseGrid {
             layers,
             geometry,
             inverse_node_size,
-            reach,
             occupied_levels: 0,
-            slack,
             root_bounds,
             world_bounds,
             slots: Slots::new(),
@@ -121,73 +96,16 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
         &self.root_bounds
     }
 
-    /// Return the largest overflow beyond the cells seen on `level` since the
-    /// last [`refresh_bounds`](Self::refresh_bounds), in world units:
-    /// negative when every item stays that far inside its cell edge, and
-    /// -infinity if the level has held no items since then. Search adds the
-    /// rounding margin and caps the result at half a node.
-    ///
-    /// Panics unless `level` is in `2..=MAX_LEVEL`; the root has no neighbors
-    /// to bound.
-    pub fn overflow_bound(&self, level: usize) -> DirectionalOverflow {
-        assert!((2..=MAX_LEVEL as usize).contains(&level), "invalid level");
-        let [left, right, top, bottom] = self.reach[level].reach;
-        DirectionalOverflow {
-            left,
-            right,
-            top,
-            bottom,
-        }
-    }
-
-    /// Shrink the box of every node to the bounds of its current items, and
-    /// the bound of every level to the largest overflow of those items,
+    /// Shrink the box of every node to the bounds of its current items,
     /// undoing the growth from items that have since moved, shrunk or left.
     /// Visits every node and item at most once.
-    ///
-    /// A refreshed box is the union of its items, so its overflow beyond the
-    /// cell equals the largest overflow of those items bit for bit; the bounds
-    /// are therefore computed from the boxes, one per node instead of one per
-    /// item.
     pub fn refresh_bounds(&mut self) {
-        let origin = self.root_bounds.get_min();
         for level in 1..=MAX_LEVEL as usize {
-            let geometry = &self.geometry[level];
-            let node_size = (geometry.node_width, geometry.node_height);
-            let mut largest = [f64::NEG_INFINITY; 4];
             // Every node of a level without items has already reset its box.
-            if !geometry.is_empty() {
-                let grid = &mut self.layers[level];
-                let cols = grid.cols();
-                // Visit the nodes in storage order, i.e. row by row.
-                let (mut x, mut y) = (0, 0);
-                for node in grid.iter_mut() {
-                    node.refresh();
-                    if !node.items.is_empty() {
-                        let overflow = cell_overflow(&node.bounds, origin, node_size, (x, y));
-                        for (largest, overflow) in largest.iter_mut().zip(overflow) {
-                            *largest = higher(*largest, overflow);
-                        }
-                    }
-                    x += 1;
-                    if x == cols {
-                        x = 0;
-                        y += 1;
-                    }
-                }
+            if !self.geometry[level].is_empty() {
+                self.layers[level].iter_mut().for_each(BoxedLooseGridNode::refresh);
             }
-            self.reach[level].set(largest, self.slack);
         }
-    }
-
-    /// Raise the bound of the level of `coord` to cover `bounds` stored at
-    /// `coord`.
-    #[inline]
-    fn grow_reach(&mut self, bounds: &Rectangle, (level, x, y): Coord) {
-        let geometry = &self.geometry[level];
-        let node_size = (geometry.node_width, geometry.node_height);
-        let overflow = cell_overflow(bounds, self.root_bounds.get_min(), node_size, (x, y));
-        self.reach[level].grow(overflow, self.slack);
     }
 
     /// Find the level and coordinates of the node that stores an item with
@@ -226,7 +144,7 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
         (x, y)
     }
 
-    fn get_root(&self) -> &BoxedOverflowBoundGridNode<T> {
+    fn get_root(&self) -> &BoxedLooseGridNode<T> {
         unsafe { self.layers.get_unchecked(1).get_unchecked(0, 0) }
     }
 
@@ -234,7 +152,6 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
     /// [`update`](Self::update) and [`remove`](Self::remove).
     pub fn insert(&mut self, bounds: Rectangle, item: T) -> ItemHandle {
         let coord @ (level, x, y) = self.position(&bounds);
-        self.grow_reach(&bounds, coord);
         let node = &mut self.layers[level][y][x];
         node.grow(&bounds);
         let handle = self
@@ -282,7 +199,6 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
 
         let (nl, nx, ny) = curt_coord;
         let entry = self.take_entry(level, x, y, i);
-        self.grow_reach(&bounds, curt_coord);
         let new_node = &mut self.layers[nl][ny][nx];
         new_node.grow(&bounds);
         *self.slots.get_mut(handle) = GridLocation::new(curt_coord, new_node.items.len());
@@ -292,9 +208,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
     }
 
     /// Overwrite the bounds of an entry that stays in its node, and grow the
-    /// box of the node and the bound of its level to cover them.
+    /// box of the node to cover them.
     fn replace_bounds(&mut self, coord: Coord, index: usize, bounds: Rectangle) {
-        self.grow_reach(&bounds, coord);
         let (level, x, y) = coord;
         let node = &mut self.layers[level][y][x];
         node.grow(&bounds);
@@ -341,8 +256,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
 
     /// Check cheaply that `position` would still return `coord` for `bounds`.
     ///
-    /// See [`HierarchicalLooseGrid`](crate::HierarchicalLooseGrid) for why the
-    /// cached limits agree with `position` exactly.
+    /// [`LayerGeometry::matches_layer`] and [`LayerGeometry::matches_cell`]
+    /// explain why the cached limits agree with `position` exactly.
     fn stays_in_node(&self, bounds: &Rectangle, coord: Coord) -> bool {
         let (level, x, y) = coord;
         let geometry = &self.geometry[level];
@@ -366,11 +281,7 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
     /// each, so that consecutive searches read nearby cells and the same
     /// ancestors. The walk stops at the finest level that holds items but
     /// visits every cell down to it, so where cells far outnumber items,
-    /// searching item by item is faster. On the search bench's distribution,
-    /// the `self_query` bench group measured it 14% faster than searching
-    /// item by item in random order with 10,000 items, and a one-off probe
-    /// outside the repository 28% with 640,000 items at the same
-    /// density, where the random order misses the cache.
+    /// searching item by item is faster.
     pub fn for_each_self_query(&self, mut callback: impl FnMut(T, T)) {
         let layers = &self.layers;
         // Levels finer than the finest one holding items need no visit.
@@ -390,11 +301,52 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
         );
     }
 
+    /// Call `callback` once for every pair of distinct stored items whose
+    /// bounds intersect, with the two items in either order. On its own level
+    /// an item reads only the items after it in its own node and the nodes
+    /// after its own in row-major order, that is the neighbor to the right
+    /// and those in the row below, where a search with its bounds would read
+    /// them; items in the root pair up with the root items after them. Below
+    /// its level an item scans the finer levels as a search does, so a pair
+    /// across levels is found once, by the item on the coarser level, and no
+    /// item looks above its own level. The nodes are visited as in
+    /// [`for_each_self_query`](Self::for_each_self_query).
+    ///
+    /// Leaving each cross-level pair to its finer item instead, which walked
+    /// the ancestor path as a search does, took 1.05 ms against 0.39 ms on the
+    /// mixed distribution: nearly all items lie on the finest level, and each
+    /// of them paid for a walk over the occupied levels above it.
+    pub fn for_each_pair(&self, mut callback: impl FnMut(T, T)) {
+        let layers = &self.layers;
+        // Levels finer than the finest one holding items need no visit.
+        let Some(finest) =
+            (1..=MAX_LEVEL as usize).rev().find(|&level| !self.geometry[level].is_empty())
+        else {
+            return;
+        };
+        for_each_cell_hierarchically(
+            finest,
+            |level| (layers[level].cols(), layers[level].rows()),
+            |level, x, y| {
+                for (index, entry) in layers[level][y][x].items.iter().enumerate() {
+                    let mut report = |found| callback(entry.item, found);
+                    if level == 1 {
+                        self.get_root().pair_with_after(index, &entry.bounds, &mut report);
+                    } else {
+                        self.pair_half_stencil(level, (x, y), index, &entry.bounds, &mut report);
+                    }
+                    if level < finest {
+                        self.pair_scan_down(level, &entry.bounds, &mut report);
+                    }
+                }
+            },
+        );
+    }
+
     /// Search from the bottom up, calling `callback` for each item found.
     ///
-    /// Follows [`HierarchicalLooseGrid::search`], except that each level
-    /// reaches beyond its cells only as far as its bound allows, and that a
-    /// node whose box misses the query is skipped without reading its items.
+    /// Follows [`HierarchicalLooseGrid::search`], except that a node whose box
+    /// misses the query is skipped without reading its items.
     ///
     /// [`HierarchicalLooseGrid::search`]: crate::HierarchicalLooseGrid::search
     pub fn search(&self, bounds: &Rectangle, mut callback: impl FnMut(T)) {
@@ -421,31 +373,23 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
             layers[level + 1..=max_level]
                 .iter()
                 .zip(&self.geometry[level + 1..=max_level])
-                .zip(&self.reach[level + 1..=max_level])
                 .zip(&self.inverse_node_size[level + 1..=max_level])
                 .rev()
-                .for_each(|(((grid, geometry), reach), &(inverse_width, inverse_height))| {
+                .for_each(|((grid, geometry), &(inverse_width, inverse_height))| {
                     if geometry.is_empty() {
                         return;
                     }
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
 
-                    // Cells at lower coordinates than the query range count as
-                    // far as their items reach in the positive direction, and
-                    // vice versa.
-                    // Coordinates are in nodes and the shrink in half nodes, so
-                    // the shrink counts half.
-                    let [left, right, top, bottom] = reach.shrink;
-                    // Both ends include a node whose items reach exactly to the
-                    // query, as in `scan_range`.
-                    let min_coord_x = first_reaching_node(min_x * inverse_width + right * 0.5);
-                    let min_coord_y = first_reaching_node(min_y * inverse_height + bottom * 0.5);
+                    // Items reach half a node beyond their cells. Both ends
+                    // include a node whose items reach exactly to the query, as
+                    // in `scan_range`.
+                    let min_coord_x = first_reaching_node(min_x * inverse_width);
+                    let min_coord_y = first_reaching_node(min_y * inverse_height);
 
-                    let max_coord_x =
-                        last_reaching_node(max_x * inverse_width - left * 0.5).min(grid_width - 1);
-                    let max_coord_y =
-                        last_reaching_node(max_y * inverse_height - top * 0.5).min(grid_height - 1);
+                    let max_coord_x = last_reaching_node(max_x * inverse_width).min(grid_width - 1);
+                    let max_coord_y = last_reaching_node(max_y * inverse_height).min(grid_height - 1);
 
                     // Scan the resulting range.
                     for y in min_coord_y..=max_coord_y {
@@ -455,8 +399,6 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                                 continue;
                             }
 
-                            // The shrunk range lies within the fixed-reach range,
-                            // so its inner part lies within that of the latter.
                             if y > min_coord_y + 1
                                 && y < max_coord_y - 1
                                 && x > min_coord_x + 1
@@ -481,6 +423,113 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
         self.search_up_3x3(level, bounds, &mut callback);
     }
 
+    /// Search the half stencil of [`for_each_pair`] on level `level`: node
+    /// `(x, y)` after its item `start`, and of the neighbors after it in
+    /// row-major order those that the ancestor walk of a search with
+    /// `bounds` would read, by the same center-line tests.
+    ///
+    /// [`for_each_pair`]: Self::for_each_pair
+    fn pair_half_stencil(
+        &self,
+        level: usize,
+        (x, y): (usize, usize),
+        start: usize,
+        bounds: &Rectangle,
+        callback: &mut impl FnMut(T),
+    ) {
+        let grid = &self.layers[level];
+        let geometry = &self.geometry[level];
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let center_x = offset_x + geometry.node_width * (x as f64 + 0.5);
+        let center_y = offset_y + geometry.node_height * (y as f64 + 0.5);
+        let to_right = bounds.max_x >= center_x && x + 1 != grid.cols();
+        let to_left = bounds.min_x <= center_x && x != 0;
+        // SAFETY: `(x, y)` is a node of `grid`, and each neighbor is read only
+        // after testing that it exists.
+        unsafe {
+            grid.get_unchecked(y, x).pair_with_after(start, bounds, callback);
+            if to_right {
+                grid.get_unchecked(y, x + 1).pair_with(bounds, callback);
+            }
+            if bounds.max_y >= center_y && y + 1 != grid.rows() {
+                if to_left {
+                    grid.get_unchecked(y + 1, x - 1).pair_with(bounds, callback);
+                }
+                grid.get_unchecked(y + 1, x).pair_with(bounds, callback);
+                if to_right {
+                    grid.get_unchecked(y + 1, x + 1).pair_with(bounds, callback);
+                }
+            }
+        }
+    }
+
+    /// Scan the levels finer than `level` over `bounds` for
+    /// [`for_each_pair`](Self::for_each_pair) as [`search`](Self::search)
+    /// scans the levels finer than a query's, a copy so that pair queries and
+    /// searches share no code.
+    fn pair_scan_down(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        // As in `search`: a NaN corner meets nothing, while for a NaN minimum
+        // the scan would report the items of the nodes it takes as inside
+        // `bounds` untested.
+        if bounds.has_nan() {
+            return;
+        }
+        let max_level = MAX_LEVEL as usize;
+        let (offset_x, offset_y) = self.root_bounds.get_min();
+        let layers = &self.layers;
+        // Top-left corner, relative to the root origin.
+        let min_x = bounds.min_x - offset_x;
+        let min_y = bounds.min_y - offset_y;
+
+        // Bottom-right corner, relative to the root origin.
+        let max_x = bounds.max_x - offset_x;
+        let max_y = bounds.max_y - offset_y;
+
+        layers[level + 1..=max_level]
+            .iter()
+            .zip(&self.geometry[level + 1..=max_level])
+            .zip(&self.inverse_node_size[level + 1..=max_level])
+            .rev()
+            .for_each(|((grid, geometry), &(inverse_width, inverse_height))| {
+                if geometry.is_empty() {
+                    return;
+                }
+                let grid_width = grid.cols();
+                let grid_height = grid.rows();
+
+                // Items reach half a node beyond their cells. Both ends
+                // include a node whose items reach exactly to the query, as
+                // in `scan_range`.
+                let min_coord_x = first_reaching_node(min_x * inverse_width);
+                let min_coord_y = first_reaching_node(min_y * inverse_height);
+
+                let max_coord_x = last_reaching_node(max_x * inverse_width).min(grid_width - 1);
+                let max_coord_y = last_reaching_node(max_y * inverse_height).min(grid_height - 1);
+
+                // Scan the resulting range.
+                for y in min_coord_y..=max_coord_y {
+                    for x in min_coord_x..=max_coord_x {
+                        let node = unsafe { grid.get_unchecked(y, x) };
+                        if node.items.is_empty() {
+                            continue;
+                        }
+
+                        if y > min_coord_y + 1
+                            && y < max_coord_y - 1
+                            && x > min_coord_x + 1
+                            && x < max_coord_x - 1
+                        {
+                            // The node lies within `bounds`, loose bounds
+                            // included, so its items need no intersection test.
+                            node.pair_all(callback);
+                        } else {
+                            node.pair_with(bounds, callback);
+                        }
+                    }
+                }
+            });
+    }
+
     fn search_up_3x3(&self, level: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
         let (mut x, mut y) = self.cell_containing(level, bounds.get_center());
 
@@ -499,9 +548,8 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
         self.layers[coarsest..=level]
             .iter()
             .zip(&self.geometry[coarsest..=level])
-            .zip(&self.reach[coarsest..=level])
             .rev()
-            .for_each(|((grid, geometry), reach)| unsafe {
+            .for_each(|(grid, geometry)| unsafe {
                 if !geometry.is_empty() {
                     let grid_width = grid.cols();
                     let grid_height = grid.rows();
@@ -511,21 +559,12 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                         "walk cell ({x}, {y}) outside {grid_width}x{grid_height}"
                     );
 
-                    // Coordinates up to which the items of each neighboring
-                    // column and row reach into this cell; the fixed reach ends
-                    // at its center.
-                    let [left, right, top, bottom] = reach.shrink;
-                    let left_column_reach = center_x - right * half_width;
-                    let right_column_reach = center_x + left * half_width;
-                    let top_row_reach = center_y - bottom * half_height;
-                    let bottom_row_reach = center_y + top * half_height;
-
-                    // A query that starts or ends exactly on the fixed reach,
-                    // the center line, still meets an item whose bounds round
-                    // a float past it, so the tests include the reach. A
-                    // shrunk reach already holds the rounding margin.
-                    if bounds.min_y <= top_row_reach && y != 0 {
-                        if bounds.min_x <= left_column_reach && x != 0 {
+                    // The items of each neighboring column and row reach up to
+                    // the center lines of this cell. A query that starts or
+                    // ends exactly on a center line still meets an item whose
+                    // bounds round a float past it, so the tests include it.
+                    if bounds.min_y <= center_y && y != 0 {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y - 1, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -535,14 +574,14 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x >= right_column_reach && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y - 1, x + 1);
                             node.search_items(bounds, callback);
                         }
                     }
 
                     {
-                        if bounds.min_x <= left_column_reach && x != 0 {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -552,14 +591,14 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x >= right_column_reach && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y, x + 1);
                             node.search_items(bounds, callback);
                         }
                     }
 
-                    if bounds.max_y >= bottom_row_reach && y + 1 != grid_height {
-                        if bounds.min_x <= left_column_reach && x != 0 {
+                    if bounds.max_y >= center_y && y + 1 != grid_height {
+                        if bounds.min_x <= center_x && x != 0 {
                             let node = grid.get_unchecked(y + 1, x - 1);
                             node.search_items(bounds, callback);
                         }
@@ -569,7 +608,7 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
                             node.search_items(bounds, callback);
                         }
 
-                        if bounds.max_x >= right_column_reach && x + 1 != grid_width {
+                        if bounds.max_x >= center_x && x + 1 != grid_width {
                             let node = grid.get_unchecked(y + 1, x + 1);
                             node.search_items(bounds, callback);
                         }
@@ -592,14 +631,14 @@ impl<T: Copy, const MAX_LEVEL: u8> BoxedOverflowBoundGrid<T, MAX_LEVEL> {
     }
 }
 
-struct BoxedOverflowBoundGridNode<T: Copy> {
+struct BoxedLooseGridNode<T: Copy> {
     /// Box covering the bounds of every item in `items`; [`EMPTY`] while there
     /// are none.
     bounds: Rectangle,
     items: Vec<Entry<T>>,
 }
 
-impl<T: Copy> BoxedOverflowBoundGridNode<T> {
+impl<T: Copy> BoxedLooseGridNode<T> {
     fn new() -> Self {
         Self {
             bounds: EMPTY,
@@ -632,6 +671,33 @@ impl<T: Copy> BoxedOverflowBoundGridNode<T> {
             .for_each(|entry| callback(entry.item));
     }
 
+    /// [`search_items`](Self::search_items) for the pair queries, a copy so
+    /// that they share no code with the searches.
+    fn pair_with(&self, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        if !self.bounds.intersects(bounds) {
+            return;
+        }
+        self.items
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// Test the items after `index` against `bounds`, without the box, which
+    /// covers the item at `index` and thus meets any query it makes.
+    fn pair_with_after(&self, index: usize, bounds: &Rectangle, callback: &mut impl FnMut(T)) {
+        self.items[index + 1..]
+            .iter()
+            .filter(|entry| entry.bounds.intersects(bounds))
+            .for_each(|entry| callback(entry.item));
+    }
+
+    /// [`iter_items`](Self::iter_items) for the pair queries, a copy so that
+    /// they share no code with the searches.
+    fn pair_all(&self, callback: &mut impl FnMut(T)) {
+        self.items.iter().for_each(|entry| callback(entry.item));
+    }
+
     fn iter_items(&self, callback: &mut impl FnMut(T)) {
         self.items.iter().for_each(|entry| callback(entry.item));
     }
@@ -654,7 +720,7 @@ mod tests {
     use rand::prelude::*;
 
     const MAX_LEVEL: u8 = 7;
-    type Tree = BoxedOverflowBoundGrid<usize, MAX_LEVEL>;
+    type Tree = BoxedLooseGrid<usize, MAX_LEVEL>;
 
     const WORLDS: [Rectangle; 3] = [
         Rectangle::new(-128.0, -128.0, 896.0, 384.0),
@@ -662,5 +728,6 @@ mod tests {
         Rectangle::new(0.3, -0.7, 1000.1, 333.3),
     ];
 
-    crate::grid_tests::boxed_tests!(BoxedOverflowBoundGridNode);
+    crate::grid_tests::refreshed_tests!();
+    crate::grid_tests::lazy_box_tests!(BoxedLooseGridNode);
 }
